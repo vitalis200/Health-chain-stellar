@@ -76,7 +76,7 @@
                   "u64": 86400
                 },
                 {
-                  "symbol": "Main_Hosp"
+                  "string": "Main_Hosp"
                 }
               ]
             }
@@ -167,7 +167,7 @@
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": {
-              "symbol": "HOSPITAL"
+              "symbol": "HOSPS"
             },
             "durability": "persistent"
           }
@@ -180,7 +180,7 @@
                 "ext": "v0",
                 "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
                 "key": {
-                  "symbol": "HOSPITAL"
+                  "symbol": "HOSPS"
                 },
                 "durability": "persistent",
                 "val": {
@@ -207,7 +207,7 @@
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": {
-              "symbol": "NEXT_ID"
+              "symbol": "NEXT_REQ"
             },
             "durability": "persistent"
           }
@@ -220,7 +220,7 @@
                 "ext": "v0",
                 "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
                 "key": {
-                  "symbol": "NEXT_ID"
+                  "symbol": "NEXT_REQ"
                 },
                 "durability": "persistent",
                 "val": {
@@ -238,7 +238,7 @@
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": {
-              "symbol": "REQS"
+              "symbol": "REQUESTS"
             },
             "durability": "persistent"
           }
@@ -251,7 +251,7 @@
                 "ext": "v0",
                 "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
                 "key": {
-                  "symbol": "REQS"
+                  "symbol": "REQUESTS"
                 },
                 "durability": "persistent",
                 "val": {
@@ -287,8 +287,14 @@
                               "symbol": "delivery_address"
                             },
                             "val": {
-                              "symbol": "Main_Hosp"
+                              "string": "Main_Hosp"
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "fulfillment_timestamp"
+                            },
+                            "val": "void"
                           },
                           {
                             "key": {
@@ -308,7 +314,7 @@
                           },
                           {
                             "key": {
-                              "symbol": "quantity"
+                              "symbol": "quantity_ml"
                             },
                             "val": {
                               "u32": 500
@@ -324,10 +330,22 @@
                           },
                           {
                             "key": {
+                              "symbol": "reserved_unit_ids"
+                            },
+                            "val": {
+                              "vec": []
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "status"
                             },
                             "val": {
-                              "symbol": "PENDING"
+                              "vec": [
+                                {
+                                  "symbol": "Pending"
+                                }
+                              ]
                             }
                           },
                           {
@@ -343,6 +361,103 @@
                             }
                           }
                         ]
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          4095
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "symbol": "REQ_KEYS"
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "symbol": "REQ_KEYS"
+                },
+                "durability": "persistent",
+                "val": {
+                  "map": [
+                    {
+                      "key": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "blood_type"
+                            },
+                            "val": {
+                              "vec": [
+                                {
+                                  "symbol": "ABNegative"
+                                }
+                              ]
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "delivery_address"
+                            },
+                            "val": {
+                              "string": "Main_Hosp"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "hospital_id"
+                            },
+                            "val": {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "quantity_ml"
+                            },
+                            "val": {
+                              "u32": 500
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "required_by"
+                            },
+                            "val": {
+                              "u64": 86400
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "urgency"
+                            },
+                            "val": {
+                              "vec": [
+                                {
+                                  "symbol": "High"
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": 1
                       }
                     }
                   ]
@@ -483,6 +598,22 @@
                 },
                 {
                   "key": {
+                    "symbol": "created_at"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "delivery_address"
+                  },
+                  "val": {
+                    "string": "Main_Hosp"
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "hospital_id"
                   },
                   "val": {
@@ -503,6 +634,14 @@
                   },
                   "val": {
                     "u64": 1
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "required_by"
+                  },
+                  "val": {
+                    "u64": 86400
                   }
                 },
                 {

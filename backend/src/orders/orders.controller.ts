@@ -12,7 +12,6 @@ import {
   HttpStatus,
   Request,
   ValidationPipe,
-  BadRequestException,
 } from '@nestjs/common';
 import { OrdersService } from './orders.service';
 import { OrderQueryParamsDto } from './dto/order-query-params.dto';

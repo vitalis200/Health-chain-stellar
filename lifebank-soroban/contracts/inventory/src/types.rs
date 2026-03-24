@@ -34,6 +34,7 @@ pub enum BloodType {
 /// Status transitions follow this flow:
 /// Available -> Reserved -> InTransit -> Delivered
 ///           \-> Expired (can happen at any stage)
+///           \-> Compromised (temperature violations trigger this)
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 pub enum BloodStatus {
@@ -47,6 +48,8 @@ pub enum BloodStatus {
     Delivered,
     /// Expired and no longer usable (typically after 42 days for whole blood)
     Expired,
+    /// Compromised due to 3 consecutive temperature violations - unsafe for use
+    Compromised,
 }
 
 /// Complete blood unit record stored in the inventory contract
@@ -137,44 +140,55 @@ impl BloodType {
 }
 
 impl BloodStatus {
-    /// Check if transition from current status to new status is valid
-    ///
-    /// Valid transitions:
-    /// - Available -> Reserved, Expired
-    /// - Reserved -> InTransit, Available (if cancelled), Expired
-    /// - InTransit -> Delivered, Expired
-    /// - Delivered -> (terminal state)
-    /// - Expired -> (terminal state)
-    pub fn can_transition_to(&self, new_status: &BloodStatus) -> bool {
-        use BloodStatus::*;
-
-        match (self, new_status) {
-            // Available can go to Reserved or Expired
-            (Available, Reserved) => true,
-            (Available, Expired) => true,
-
-            // Reserved can go to InTransit, back to Available, or Expired
-            (Reserved, InTransit) => true,
-            (Reserved, Available) => true,
-            (Reserved, Expired) => true,
-
-            // InTransit can go to Delivered or Expired
-            (InTransit, Delivered) => true,
-            (InTransit, Expired) => true,
-
-            // Delivered and Expired are terminal states
-            (Delivered, _) => false,
-            (Expired, _) => false,
-
-            // No other transitions allowed
-            _ => false,
-        }
-    }
-
     /// Check if this status is a terminal state
     pub fn is_terminal(&self) -> bool {
-        matches!(self, BloodStatus::Delivered | BloodStatus::Expired)
+        matches!(
+            self,
+            BloodStatus::Delivered | BloodStatus::Expired | BloodStatus::Compromised
+        )
     }
+}
+
+/// Blood Unit Lifecycle Transition Map
+///
+/// The blood unit follows a strict forward-only lifecycle through the supply chain:
+///
+///   Available ──► Reserved ──► InTransit ──► Delivered (terminal)
+///       │             │             │
+///       ▼             ▼             ▼
+///    Expired       Expired       Expired (terminal)
+///
+///   Additionally, Reserved can transition back to Available (cancellation).
+///
+/// Valid transitions:
+///   - Available  → Reserved   (unit is reserved for a request)
+///   - Available  → Expired    (unit expired before being reserved)
+///   - Reserved   → InTransit  (unit is dispatched for delivery)
+///   - Reserved   → Available  (reservation cancelled, unit returned to pool)
+///   - Reserved   → Expired    (unit expired while reserved)
+///   - InTransit  → Delivered  (unit successfully delivered)
+///   - InTransit  → Expired    (unit expired during transport)
+///   - Delivered  → (none)     (terminal state — no further transitions)
+///   - Expired    → (none)     (terminal state — no further transitions)
+///
+/// All other transitions are invalid and will be rejected. Backwards transitions
+/// (e.g., Delivered → Available, InTransit → Reserved) are explicitly forbidden
+/// to preserve the integrity of the on-chain audit trail.
+///
+/// This is a pure function with no storage access, making it unit-testable in isolation.
+pub fn is_valid_transition(from: &BloodStatus, to: &BloodStatus) -> bool {
+    use BloodStatus::*;
+
+    matches!(
+        (from, to),
+        (Available, Reserved)
+            | (Available, Expired)
+            | (Reserved, InTransit)
+            | (Reserved, Available)
+            | (Reserved, Expired)
+            | (InTransit, Delivered)
+            | (InTransit, Expired)
+    )
 }
 
 impl BloodUnit {
@@ -386,30 +400,64 @@ mod tests {
     }
 
     #[test]
-    fn test_status_transitions_valid() {
+    fn test_is_valid_transition_all_valid() {
+        use super::is_valid_transition;
         use BloodStatus::*;
 
-        // Available transitions
-        assert!(Available.can_transition_to(&Reserved));
-        assert!(Available.can_transition_to(&Expired));
-        assert!(!Available.can_transition_to(&InTransit));
-        assert!(!Available.can_transition_to(&Delivered));
+        // All 7 valid transitions in the blood unit lifecycle
+        assert!(is_valid_transition(&Available, &Reserved));
+        assert!(is_valid_transition(&Available, &Expired));
+        assert!(is_valid_transition(&Reserved, &InTransit));
+        assert!(is_valid_transition(&Reserved, &Available)); // cancellation
+        assert!(is_valid_transition(&Reserved, &Expired));
+        assert!(is_valid_transition(&InTransit, &Delivered));
+        assert!(is_valid_transition(&InTransit, &Expired));
+    }
 
-        // Reserved transitions
-        assert!(Reserved.can_transition_to(&InTransit));
-        assert!(Reserved.can_transition_to(&Available));
-        assert!(Reserved.can_transition_to(&Expired));
-        assert!(!Reserved.can_transition_to(&Delivered));
+    #[test]
+    fn test_is_valid_transition_invalid_backwards() {
+        use super::is_valid_transition;
+        use BloodStatus::*;
 
-        // InTransit transitions
-        assert!(InTransit.can_transition_to(&Delivered));
-        assert!(InTransit.can_transition_to(&Expired));
-        assert!(!InTransit.can_transition_to(&Available));
-        assert!(!InTransit.can_transition_to(&Reserved));
+        // 1. Delivered -> Available (backwards)
+        assert!(!is_valid_transition(&Delivered, &Available));
+        // 2. Delivered -> Reserved (backwards)
+        assert!(!is_valid_transition(&Delivered, &Reserved));
+        // 3. Delivered -> InTransit (backwards)
+        assert!(!is_valid_transition(&Delivered, &InTransit));
+        // 4. Delivered -> Expired (terminal cannot transition)
+        assert!(!is_valid_transition(&Delivered, &Expired));
+        // 5. Expired -> Available (backwards from terminal)
+        assert!(!is_valid_transition(&Expired, &Available));
+        // 6. Expired -> Reserved (backwards from terminal)
+        assert!(!is_valid_transition(&Expired, &Reserved));
+        // 7. Expired -> InTransit (backwards from terminal)
+        assert!(!is_valid_transition(&Expired, &InTransit));
+        // 8. Expired -> Delivered (backwards from terminal)
+        assert!(!is_valid_transition(&Expired, &Delivered));
+        // 9. InTransit -> Available (skip backwards)
+        assert!(!is_valid_transition(&InTransit, &Available));
+        // 10. InTransit -> Reserved (backwards)
+        assert!(!is_valid_transition(&InTransit, &Reserved));
+        // 11. Available -> Delivered (skip forward)
+        assert!(!is_valid_transition(&Available, &Delivered));
+        // 12. Available -> InTransit (skip forward)
+        assert!(!is_valid_transition(&Available, &InTransit));
+        // 13. Reserved -> Delivered (skip forward)
+        assert!(!is_valid_transition(&Reserved, &Delivered));
+    }
 
-        // Terminal states
-        assert!(!Delivered.can_transition_to(&Expired));
-        assert!(!Expired.can_transition_to(&Delivered));
+    #[test]
+    fn test_is_valid_transition_self_transitions_invalid() {
+        use super::is_valid_transition;
+        use BloodStatus::*;
+
+        // No status should be able to transition to itself
+        assert!(!is_valid_transition(&Available, &Available));
+        assert!(!is_valid_transition(&Reserved, &Reserved));
+        assert!(!is_valid_transition(&InTransit, &InTransit));
+        assert!(!is_valid_transition(&Delivered, &Delivered));
+        assert!(!is_valid_transition(&Expired, &Expired));
     }
 
     #[test]

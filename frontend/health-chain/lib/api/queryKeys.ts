@@ -1,12 +1,19 @@
-
-
 import type { OrderQueryParams } from "@/lib/types/orders";
 
 export const queryKeys = {
-
   orders: {
     all: ["orders"] as const,
     list: (params: OrderQueryParams) => ["orders", "list", params] as const,
+  },
+
+  /**
+   * Riders (Issue #66)
+   */
+  riders: {
+    all: ["riders"] as const,
+    list: () => ["riders", "list"] as const,
+    detail: (id: string) => ["riders", "detail", id] as const,
+    performance: (id: string) => ["riders", "performance", id] as const,
   },
 
   /**

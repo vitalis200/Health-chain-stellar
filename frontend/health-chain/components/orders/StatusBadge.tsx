@@ -1,69 +1,39 @@
-// StatusBadge - Displays order status with color coding and icons
-
 import React from 'react';
-import { Clock, CheckCircle, Truck, CheckCircle2, XCircle } from 'lucide-react';
-import { OrderStatus } from '@/lib/types/orders';
+import { Clock, CheckCircle, Truck, CheckCircle2, XCircle, UserCheck, Moon, AlertTriangle } from 'lucide-react';
+
+type AllStatuses = 'pending' | 'confirmed' | 'in_transit' | 'delivered' | 'cancelled' | 'available' | 'on_delivery' | 'offline' | 'suspended';
 
 interface StatusBadgeProps {
-  status: OrderStatus;
+  status: AllStatuses;
   size?: 'sm' | 'md' | 'lg';
+  isStale?: boolean;
 }
 
-/**
- * StatusBadge Component
- * Displays order status with appropriate color and icon
- * 
- * Status color mapping:
- * - pending: Amber (#FFA500)
- * - confirmed: Blue (#5C9CE0)
- * - in_transit: Purple (#C68AF2)
- * - delivered: Green (#00BFA5)
- * - cancelled: Red (#D32F2F)
- */
-export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, size = 'md' }) => {
-  // Status to color mapping
-  const colorClasses = {
-    pending: 'bg-amber-100 text-amber-700 border-amber-300',
-    confirmed: 'bg-blue-100 text-blue-700 border-blue-300',
-    in_transit: 'bg-purple-100 text-purple-700 border-purple-300',
-    delivered: 'bg-green-100 text-green-700 border-green-300',
-    cancelled: 'bg-red-100 text-red-700 border-red-300',
+export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, size = 'md', isStale = false }) => {
+  const colorClasses: Record<AllStatuses, string> = {
+    pending: 'bg-white border-brand-black text-brand-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]',
+    confirmed: 'bg-blue-50 border-blue-600 text-blue-700',
+    in_transit: 'bg-white border-brand-black text-brand-black',
+    delivered: 'bg-white border-brand-black text-brand-black',
+    cancelled: 'bg-gray-50 border-gray-300 text-gray-400',
+    available: 'bg-white border-brand-black text-brand-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]',
+    on_delivery: 'bg-[#E22A2A] border-[#E22A2A] text-white',
+    offline: 'bg-gray-100 border-gray-200 text-gray-500',
+    suspended: 'bg-black border-black text-white',
   };
 
-  // Status to icon mapping
-  const StatusIcon = {
-    pending: Clock,
-    confirmed: CheckCircle,
-    in_transit: Truck,
-    delivered: CheckCircle2,
-    cancelled: XCircle,
-  }[status];
-
-  // Size classes
-  const sizeClasses = {
-    sm: 'px-2 py-1 text-xs gap-1',
-    md: 'px-3 py-1.5 text-sm gap-1.5',
-    lg: 'px-4 py-2 text-base gap-2',
+  const iconMap: Record<AllStatuses, React.ElementType> = {
+    pending: Clock, confirmed: CheckCircle, in_transit: Truck, delivered: CheckCircle2, cancelled: XCircle,
+    available: UserCheck, on_delivery: Truck, offline: Moon, suspended: AlertTriangle,
   };
 
-  const iconSizes = {
-    sm: 12,
-    md: 14,
-    lg: 16,
-  };
-
-  // Format status text (capitalize and replace underscores)
-  const statusText = status
-    .split('_')
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
-
+  const StatusIcon = iconMap[status] || AlertTriangle;
+  const sizeClasses = { sm: 'px-3 py-1 text-[11px] gap-1.5', md: 'px-4 py-2 text-[13px] gap-2', lg: 'px-5 py-2.5 text-[15px] gap-2.5' };
+  
   return (
-    <span
-      className={`inline-flex items-center font-medium rounded-full border ${colorClasses[status]} ${sizeClasses[size]}`}
-    >
-      <StatusIcon size={iconSizes[size]} />
-      <span>{statusText}</span>
+    <span className={`inline-flex items-center font-manrope font-bold uppercase tracking-wider rounded-full border transition-all ${colorClasses[status]} ${sizeClasses[size]} ${isStale ? 'opacity-50' : ''}`}>
+      <StatusIcon size={size === 'sm' ? 12 : 14} />
+      {status.replace('_', ' ')}
     </span>
   );
 };

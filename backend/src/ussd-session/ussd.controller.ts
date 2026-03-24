@@ -9,7 +9,7 @@ import {
   UsePipes,
   ValidationPipe,
 } from '@nestjs/common';
-import { Response } from 'express';
+import type { Response } from 'express';
 import { UssdService } from './ussd.service';
 import { UssdSessionDto } from './ussd.dto';
 import { UssdRequest } from './ussd.types';

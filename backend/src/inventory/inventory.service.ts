@@ -168,4 +168,76 @@ export class InventoryService {
       );
     }
   }
+
+  async getCriticalStockItems() {
+    return this.getLowStockItems(5);
+  }
+
+  async getStockAggregation() {
+    const data = await this.inventoryRepo
+      .createQueryBuilder('inventory')
+      .select('inventory.bloodType', 'bloodType')
+      .addSelect('SUM(inventory.availableUnits)', 'totalUnits')
+      .groupBy('inventory.bloodType')
+      .getRawMany();
+
+    return {
+      message: 'Stock aggregation retrieved successfully',
+      data,
+    };
+  }
+
+  async getInventoryStats(hospitalId?: string) {
+    const where = hospitalId ? { bloodBankId: hospitalId } : {};
+    const items = await this.inventoryRepo.find({ where });
+    
+    const totalUnits = items.reduce((sum, item) => sum + item.availableUnits, 0);
+    const lowStockCount = items.filter(item => item.availableUnits <= 10).length;
+
+    return {
+      message: 'Inventory stats retrieved successfully',
+      data: {
+        totalItems: items.length,
+        totalUnits,
+        lowStockCount,
+      },
+    };
+  }
+
+  async getReorderSummary() {
+    const lowStock = await this.getLowStockItems(10);
+    return {
+      message: 'Reorder summary retrieved successfully',
+      data: lowStock.data,
+    };
+  }
+
+  async reserveStock(id: string, quantity: number) {
+    const item = await this.inventoryRepo.findOne({ where: { id } });
+    if (!item) {
+      throw new NotFoundException(`Inventory item '${id}' not found`);
+    }
+    if (item.availableUnits < quantity) {
+      throw new ConflictException('Insufficient stock');
+    }
+    item.availableUnits -= quantity;
+    const data = await this.inventoryRepo.save(item);
+    return {
+      message: 'Stock reserved successfully',
+      data,
+    };
+  }
+
+  async releaseStock(id: string, quantity: number) {
+    const item = await this.inventoryRepo.findOne({ where: { id } });
+    if (!item) {
+      throw new NotFoundException(`Inventory item '${id}' not found`);
+    }
+    item.availableUnits += quantity;
+    const data = await this.inventoryRepo.save(item);
+    return {
+      message: 'Stock released successfully',
+      data,
+    };
+  }
 }

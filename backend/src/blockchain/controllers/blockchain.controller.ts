@@ -9,7 +9,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { SorobanService } from '../services/soroban.service';
-import { SorobanTxJob, QueueMetrics, SorobanTxResult } from '../types/soroban-tx.types';
+import type { SorobanTxJob, QueueMetrics, SorobanTxResult } from '../types/soroban-tx.types';
 import { AdminGuard } from '../guards/admin.guard';
 
 @Controller('blockchain')

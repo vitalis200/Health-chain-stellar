@@ -17,6 +17,7 @@ import { OrderEventEntity } from './entities/order-event.entity';
 import { OrderStatus } from './enums/order-status.enum';
 import { OrderEventType } from './enums/order-event-type.enum';
 import { Order, BloodType } from './types/order.types';
+import type { OrderStatus as OrderStatusType } from './types/order.types';
 import { OrderQueryParamsDto } from './dto/order-query-params.dto';
 import { OrdersResponseDto } from './dto/orders-response.dto';
 import {
@@ -58,7 +59,7 @@ export class OrdersService {
   // ─── Queries ─────────────────────────────────────────────────────────────
 
   async findAll(status?: string, hospitalId?: string) {
-    const where: Partial<OrderEntity> = {};
+    const where: any = {};
     if (status) where.status = status as OrderStatus;
     if (hospitalId) where.hospitalId = hospitalId;
 
@@ -110,9 +111,9 @@ export class OrdersService {
 
     // Apply status filter
     if (statuses) {
-      const statusArray = statuses.split(',') as OrderStatus[];
+      const statusArray = statuses.split(',');
       filteredOrders = filteredOrders.filter((order) =>
-        statusArray.includes(order.status)
+        statusArray.includes(order.status as string)
       );
     }
 
@@ -125,11 +126,11 @@ export class OrdersService {
     }
 
     // Sort orders with active orders prioritization
-    const activeStatuses = ['pending', 'confirmed', 'in_transit'];
+    const activeStatuses = [OrderStatus.PENDING, OrderStatus.CONFIRMED, OrderStatus.IN_TRANSIT];
     filteredOrders.sort((a, b) => {
       // First, prioritize active orders
-      const aIsActive = activeStatuses.includes(a.status);
-      const bIsActive = activeStatuses.includes(b.status);
+      const aIsActive = activeStatuses.includes(a.status as any);
+      const bIsActive = activeStatuses.includes(b.status as any);
 
       if (aIsActive && !bIsActive) return -1;
       if (!aIsActive && bIsActive) return 1;

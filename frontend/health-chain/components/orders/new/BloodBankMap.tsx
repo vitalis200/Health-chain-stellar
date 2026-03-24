@@ -35,6 +35,8 @@ export const BloodBankMap: React.FC<BloodBankMapProps> = ({
     // Dynamically import Leaflet to avoid SSR issues
     const initMap = async () => {
       const L = (await import("leaflet")).default;
+
+      // @ts-ignore - Leaflet CSS does not have type definitions
       await import("leaflet/dist/leaflet.css");
 
       if (!mapRef.current || mapInstanceRef.current) return;

@@ -7,7 +7,7 @@ mod types;
 mod validation;
 
 use crate::error::ContractError;
-use crate::types::{BloodStatus, BloodType, BloodUnit, DataKey};
+use crate::types::{BloodStatus, BloodType, BloodUnit, DataKey, is_valid_transition};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 #[contract]
@@ -39,12 +39,17 @@ impl InventoryContract {
 
     /// Register a new blood donation into the inventory
     ///
+    /// Both `donation_timestamp` (collected_at) and `expiration_timestamp` (expiry_at)
+    /// are derived exclusively from the ledger close time (`env.ledger().timestamp()`).
+    /// This ensures that expiration checks — which also use ledger time — are always
+    /// consistent with the stored timestamps. Caller-supplied timestamps were removed
+    /// to eliminate the mismatch described in issue #98.
+    ///
     /// # Arguments
     /// * `env` - Contract environment
     /// * `bank_id` - Blood bank's address (must be authorized)
     /// * `blood_type` - Type of blood (A+, A-, B+, B-, AB+, AB-, O+, O-)
     /// * `quantity_ml` - Quantity in milliliters (100-600ml)
-    /// * `expiration_timestamp` - Unix timestamp when blood expires
     /// * `donor_id` - Optional donor address (None for anonymous)
     ///
     /// # Returns
@@ -54,7 +59,6 @@ impl InventoryContract {
     /// - `NotInitialized`: Contract not initialized
     /// - `NotAuthorizedBloodBank`: Bank is not authorized
     /// - `InvalidQuantity`: Quantity outside acceptable range
-    /// - `InvalidExpiration`: Expiration date is invalid
     ///
     /// # Events
     /// Emits `BloodRegistered` event with all blood unit details
@@ -63,7 +67,6 @@ impl InventoryContract {
         bank_id: Address,
         blood_type: BloodType,
         quantity_ml: u32,
-        expiration_timestamp: u64,
         donor_id: Option<Address>,
     ) -> Result<u64, ContractError> {
         // 1. Verify bank authentication
@@ -79,15 +82,42 @@ impl InventoryContract {
             return Err(ContractError::NotAuthorizedBloodBank);
         }
 
-        // 4. Validate input parameters
-        validation::validate_blood_registration(&env, quantity_ml, expiration_timestamp)?;
-        validation::validate_minimum_shelf_life(&env, expiration_timestamp)?;
+        // 4. Validate quantity
+        validation::validate_quantity(quantity_ml)?;
 
-        // 5. Generate unique blood unit ID
+        // 5. Generate unique blood unit ID using atomic counter increment.
+        //
+        // Soroban Transaction Ordering Model:
+        // Within a single ledger close, transactions are ordered deterministically.
+        // Each transaction sees the committed state of all preceding transactions
+        // in that ledger. The counter read-increment-write below executes within
+        // a single transaction's footprint, so two transactions calling
+        // register_blood will always see sequential counter values — the second
+        // transaction reads the counter AFTER the first transaction committed it.
+        //
+        // However, as a defense-in-depth measure against any future changes to
+        // the execution model, we also verify that no blood unit with the
+        // generated ID already exists in persistent storage before writing.
+        // This turns the registration into an atomic compare-and-set: the write
+        // only succeeds if the slot is empty, preventing any duplicate even if
+        // two transactions somehow observed the same counter value.
         let blood_unit_id = storage::increment_blood_unit_id(&env);
 
-        // 6. Create blood unit struct
+        // Guard: reject if a blood unit with this ID already exists.
+        // This makes duplicate registration impossible regardless of
+        // transaction ordering within a ledger batch.
+        if storage::blood_unit_exists(&env, blood_unit_id) {
+            return Err(ContractError::DuplicateBloodUnit);
+        }
+
+        // 6. Compute timestamps from ledger time.
+        // Using ledger time for both donation and expiration guarantees that
+        // expiration checks (which compare against env.ledger().timestamp())
+        // are always consistent with the stored values.
         let current_time = env.ledger().timestamp();
+        let expiration_timestamp =
+            current_time + (storage::BLOOD_SHELF_LIFE_DAYS * storage::SECONDS_PER_DAY);
+
         let blood_unit = BloodUnit {
             id: blood_unit_id,
             blood_type,
@@ -103,7 +133,7 @@ impl InventoryContract {
         // 7. Validate the complete blood unit
         blood_unit.validate(current_time)?;
 
-        // 8. Store blood unit
+        // 8. Store blood unit — only reaches here if the ID slot was empty.
         storage::set_blood_unit(&env, &blood_unit);
 
         // 9. Update indexes for efficient querying
@@ -164,13 +194,16 @@ impl InventoryContract {
             return Err(ContractError::BloodUnitExpired);
         }
 
-        if blood_unit.status.is_terminal() {
+        // Validate the transition using the pure is_valid_transition function.
+        // This covers terminal state checks (Delivered/Expired cannot transition)
+        // as well as all illegal backwards transitions.
+        let old_status = blood_unit.status;
+        if !is_valid_transition(&old_status, &new_status) {
+            // Emit an event with both statuses for debuggability before returning error
+            events::emit_invalid_transition(&env, unit_id, old_status, new_status);
             return Err(ContractError::InvalidStatusTransition);
         }
 
-        validation::validate_status_transition(blood_unit.status, new_status)?;
-
-        let old_status = blood_unit.status;
         blood_unit.status = new_status;
         storage::set_blood_unit(&env, &blood_unit);
 
@@ -251,13 +284,11 @@ impl InventoryContract {
                 return Err(ContractError::BloodUnitExpired);
             }
 
-            if blood_unit.status.is_terminal() {
+            let old_status = blood_unit.status;
+            if !is_valid_transition(&old_status, &new_status) {
+                events::emit_invalid_transition(&env, unit_id, old_status, new_status);
                 return Err(ContractError::InvalidStatusTransition);
             }
-
-            validation::validate_status_transition(blood_unit.status, new_status)?;
-
-            let old_status = blood_unit.status;
             blood_unit.status = new_status;
             storage::set_blood_unit(&env, &blood_unit);
 

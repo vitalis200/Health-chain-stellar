@@ -1,9 +1,11 @@
 use crate::types::{BloodStatus, BloodUnit, DataKey, StatusChangeHistory};
 use soroban_sdk::{Address, Env, String, Vec};
 
-/// Maximum expiration time (42 days for whole blood)
-pub const MAX_EXPIRATION_DAYS: u64 = 42;
 pub const SECONDS_PER_DAY: u64 = 86400;
+
+/// Standard shelf life for whole blood: 35 days.
+/// Used to compute expiration_timestamp from ledger time at registration.
+pub const BLOOD_SHELF_LIFE_DAYS: u64 = 35;
 
 /// Get the admin address
 pub fn get_admin(env: &Env) -> Address {

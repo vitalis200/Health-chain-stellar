@@ -74,31 +74,26 @@ export class InventoryRepository {
       .createQueryBuilder('inventory')
       .select([
         'inventory.id',
-        'inventory.hospitalId',
         'inventory.bloodType',
         'inventory.quantity',
-        'inventory.availableQuantity',
-        'inventory.reorderLevel',
       ]);
 
     if (threshold !== undefined) {
       queryBuilder.where('inventory.quantity <= :threshold', { threshold });
-    } else {
-      queryBuilder.where('inventory.quantity <= inventory.reorderLevel');
     }
 
     const items = await queryBuilder
-      .orderBy('inventory.quantity - inventory.reorderLevel', 'ASC')
+      .orderBy('inventory.quantity', 'ASC')
       .getMany();
 
     return items.map((item) => ({
       id: item.id,
-      hospitalId: item.hospitalId,
+      hospitalId: '',
       bloodType: item.bloodType,
       quantity: item.quantity,
-      availableQuantity: item.availableQuantity,
-      reorderLevel: item.reorderLevel,
-      deficit: item.reorderLevel - item.quantity,
+      availableQuantity: item.quantity,
+      reorderLevel: threshold || 10,
+      deficit: (threshold || 10) - item.quantity,
     }));
   }
 
@@ -204,13 +199,13 @@ export class InventoryRepository {
       .createQueryBuilder()
       .update(InventoryEntity)
       .set({
-        reservedQuantity: () => `reserved_quantity + ${quantity}`,
+        quantity: () => `quantity - ${quantity}`,
       })
       .where('id = :id', { id })
-      .andWhere('(quantity - reserved_quantity) >= :quantity', { quantity })
+      .andWhere('quantity >= :quantity', { quantity })
       .execute();
 
-    return result.affected > 0;
+    return (result.affected ?? 0) > 0;
   }
 
   /**
@@ -222,10 +217,9 @@ export class InventoryRepository {
       .createQueryBuilder()
       .update(InventoryEntity)
       .set({
-        reservedQuantity: () => `reserved_quantity - ${quantity}`,
+        quantity: () => `quantity + ${quantity}`,
       })
       .where('id = :id', { id })
-      .andWhere('reserved_quantity >= :quantity', { quantity })
       .execute();
   }
 

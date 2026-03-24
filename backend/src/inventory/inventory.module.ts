@@ -25,12 +25,6 @@ import { UsersModule } from '../users/users.module';
     NotificationsModule,
     UsersModule,
   ],
-import { InventoryService } from './inventory.service';
-import { InventoryController } from './inventory.controller';
-import { InventoryStockEntity } from './entities/inventory-stock.entity';
-
-@Module({
-  imports: [TypeOrmModule.forFeature([InventoryStockEntity])],
   controllers: [InventoryController],
   providers: [
     InventoryService,

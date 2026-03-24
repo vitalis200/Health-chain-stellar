@@ -126,7 +126,7 @@
           "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": {
-              "symbol": "HOSPITALS"
+              "symbol": "HOSPS"
             },
             "durability": "persistent"
           }
@@ -139,7 +139,7 @@
                 "ext": "v0",
                 "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
                 "key": {
-                  "symbol": "HOSPITALS"
+                  "symbol": "HOSPS"
                 },
                 "durability": "persistent",
                 "val": {

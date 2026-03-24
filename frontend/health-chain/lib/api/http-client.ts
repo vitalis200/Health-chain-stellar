@@ -94,10 +94,10 @@ export async function httpClient<T = unknown>(
   const { skipAuth = false, _retry = false, ...fetchConfig } = config;
   const url = endpoint.startsWith('http') ? endpoint : `${API_BASE_URL}${endpoint}`;
 
-  // Prepare headers
-  const headers: HeadersInit = {
+  // FIX: Use Record<string, string> to allow dynamic header keys like 'Authorization'
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    ...fetchConfig.headers,
+    ...(fetchConfig.headers as Record<string, string>),
   };
 
   // Add auth token if not skipped
@@ -116,12 +116,9 @@ export async function httpClient<T = unknown>(
 
     // Handle 401 Unauthorized
     if (response.status === 401 && !skipAuth && !_retry) {
-      // Check if refresh is already in progress
       if (isRefreshing) {
-        // Wait for the ongoing refresh to complete
         return new Promise((resolve, reject) => {
           subscribeTokenRefresh((newToken: string) => {
-            // Retry original request with new token
             httpClient<T>(endpoint, { ...config, _retry: true })
               .then(resolve)
               .catch(reject);
@@ -129,17 +126,12 @@ export async function httpClient<T = unknown>(
         });
       }
 
-      // Start refresh process
       isRefreshing = true;
 
       try {
         const newToken = await refreshAccessToken();
-
         if (newToken) {
-          // Notify all queued requests
           onTokenRefreshed(newToken);
-          
-          // Retry original request
           return httpClient<T>(endpoint, { ...config, _retry: true });
         } else {
           throw new Error('Token refresh failed');
@@ -149,13 +141,11 @@ export async function httpClient<T = unknown>(
       }
     }
 
-    // Handle other error responses
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.message || `HTTP ${response.status}: ${response.statusText}`);
     }
 
-    // Parse and return response
     const contentType = response.headers.get('content-type');
     if (contentType?.includes('application/json')) {
       return response.json();
@@ -163,7 +153,6 @@ export async function httpClient<T = unknown>(
 
     return response.text() as T;
   } catch (error) {
-    // Re-throw for caller to handle
     throw error;
   }
 }

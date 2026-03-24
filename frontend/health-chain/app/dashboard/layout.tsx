@@ -1,4 +1,5 @@
 "use client";
+
 import React, { useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
@@ -13,6 +14,7 @@ import {
   LogOut, 
   Menu,
   X,
+  Package // Added this missing import
 } from "lucide-react";
 
 function classNames(...classes: (string | undefined | null | false)[]) {
@@ -38,7 +40,6 @@ export default function DashboardLayout({
 
   return (
     <div className="flex min-h-screen bg-[#F5F7FA] font-poppins text-brand-black">
-      
       {/* Mobile Overlay */}
       {isMobileMenuOpen && (
         <div className="fixed inset-0 bg-black/50 z-40 xl:hidden" onClick={() => setIsMobileMenuOpen(false)}/>
@@ -50,7 +51,6 @@ export default function DashboardLayout({
         "w-[280px] 2xl:w-[368px]", 
         isMobileMenuOpen ? "translate-x-0" : "-translate-x-full xl:translate-x-0"
       )}>
-        
         {/* Logo Area */}
         <div className="pt-[30px] 2xl:pt-[39px] pl-[30px] 2xl:pl-[48px] pr-[15px] flex items-center gap-[10px] mb-[40px] 2xl:mb-[60px]">
            <div className="w-[50px] h-[50px] 2xl:w-[61px] 2xl:h-[62px] rounded-full bg-white shadow-[0px_4px_10px_rgba(0,0,0,0.1)] flex items-center justify-center">
@@ -61,7 +61,7 @@ export default function DashboardLayout({
            </button>
         </div>
 
-        {/* Navigatione */}
+        {/* Navigation */}
         <nav className="flex-1 px-[20px] 2xl:pl-[27px] 2xl:pr-[62px] space-y-[12px] 2xl:space-y-[17px] overflow-y-auto no-scrollbar" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
           <style jsx>{`
             nav::-webkit-scrollbar {
@@ -114,7 +114,6 @@ export default function DashboardLayout({
                 <Image src="/health-agency.jpg" alt="Profile" width={40} height={40} className="object-cover"/>
             </div>
         </div>
-
         {children}
       </main>
     </div>

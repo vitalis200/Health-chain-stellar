@@ -1,4 +1,4 @@
-use crate::types::{BloodRegisteredEvent, BloodType, StatusChangeEvent};
+use crate::types::{BloodRegisteredEvent, BloodStatus, BloodType, StatusChangeEvent};
 use soroban_sdk::{Address, Env, String, Symbol};
 
 /// Emit a BloodRegistered event
@@ -55,4 +55,18 @@ pub fn emit_status_change(
 
     env.events()
         .publish((Symbol::new(env, "status_changed"),), event);
+}
+
+/// Emit an event when an invalid status transition is attempted.
+/// Includes both the `from` and `to` statuses for debuggability.
+pub fn emit_invalid_transition(
+    env: &Env,
+    blood_unit_id: u64,
+    from_status: BloodStatus,
+    to_status: BloodStatus,
+) {
+    env.events().publish(
+        (Symbol::new(env, "invalid_transition"),),
+        (blood_unit_id, from_status as u32, to_status as u32),
+    );
 }

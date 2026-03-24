@@ -2,7 +2,6 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   Contract,
-  SorobanRpc,
   TransactionBuilder,
   Networks,
   BASE_FEE,
@@ -11,6 +10,8 @@ import {
   Asset,
   xdr,
 } from '@stellar/stellar-sdk';
+import { Server } from '@stellar/stellar-sdk/rpc';
+import * as SorobanRpc from '@stellar/stellar-sdk/rpc';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { BlockchainEvent } from './entities/blockchain-event.entity';
@@ -31,7 +32,7 @@ interface RetryConfig {
 @Injectable()
 export class SorobanService implements OnModuleInit {
   private readonly logger = new Logger(SorobanService.name);
-  private server: SorobanRpc.Server;
+  private server: Server;
   private contract: Contract;
   private sourceKeypair: Keypair;
   private networkPassphrase: string;
@@ -58,7 +59,7 @@ export class SorobanService implements OnModuleInit {
     const secretKey = this.configService.get<string>('SOROBAN_SECRET_KEY');
     const network = this.configService.get<string>('SOROBAN_NETWORK', 'testnet');
 
-    this.server = new SorobanRpc.Server(rpcUrl);
+    this.server = new Server(rpcUrl);
     this.networkPassphrase =
       network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
 
