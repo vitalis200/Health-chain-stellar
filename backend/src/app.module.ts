@@ -17,6 +17,7 @@ import { DispatchModule } from './dispatch/dispatch.module';
 import { MapsModule } from './maps/maps.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { OrganizationsModule } from './organizations/organizations.module';
+import { BloodRequestsModule } from './blood-requests/blood-requests.module';
 import { BlockchainModule } from './blockchain/blockchain.module';
 import { BullModule } from '@nestjs/bullmq';
 import { BullModule as BullClassicModule } from '@nestjs/bull';
@@ -101,6 +102,7 @@ import { throttleGetTracker } from './throttler/throttle-tracker.util';
     NotificationsModule,
     BlockchainModule,
     OrganizationsModule,
+    BloodRequestsModule,
   ],
   controllers: [AppController],
   providers: [

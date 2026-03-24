@@ -169,6 +169,29 @@ export class InventoryService {
     }
   }
 
+  /**
+   * Returns reserved units to stock (e.g. when a downstream step fails after reserve).
+   */
+  async releaseStockByBankAndType(
+    bloodBankId: string,
+    bloodType: string,
+    quantity: number,
+  ): Promise<void> {
+    if (quantity <= 0) {
+      return;
+    }
+    await this.inventoryRepo
+      .createQueryBuilder()
+      .update(InventoryStockEntity)
+      .set({
+        availableUnits: () => `"available_units" + ${quantity}`,
+        version: () => '"version" + 1',
+      })
+      .where('"blood_bank_id" = :bloodBankId', { bloodBankId })
+      .andWhere('"blood_type" = :bloodType', { bloodType })
+      .execute();
+  }
+
   async getCriticalStockItems() {
     return this.getLowStockItems(5);
   }
