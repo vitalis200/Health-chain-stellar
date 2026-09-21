@@ -100,6 +100,7 @@ pub struct DonationPledge {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VestingSchedule {
     pub donor: Address,
+    pub reward_token: Address,
     pub total_amount: i128,
     pub cliff_timestamp: u64,
     pub vest_end_timestamp: u64,
@@ -133,6 +134,8 @@ pub enum Error {
     PaymentNotLocked = 515,
     /// Dispute timeout has not yet elapsed.
     DisputeNotExpired = 516,
+    /// Vesting schedule already exists for this donor.
+    ActiveVestingExists = 517,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -142,6 +145,7 @@ const PLEDGE_COUNTER: soroban_sdk::Symbol = symbol_short!("PLG_CTR");
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
 const REWARD_TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("RWD_TOK");
+const TOTAL_OUTSTANDING_VESTING: soroban_sdk::Symbol = symbol_short!("OUT_VEST");
 /// Instance-level map: request_id (u64) → payment_id (u64).
 const REQ_IDX: soroban_sdk::Symbol = symbol_short!("REQ_IDX");
 /// Instance-level aggregate stats.
@@ -225,6 +229,10 @@ fn store_vesting(env: &Env, schedule: &VestingSchedule) {
 
 fn load_vesting(env: &Env, donor: &Address) -> Option<VestingSchedule> {
     env.storage().persistent().get(&vesting_key(donor))
+}
+
+fn remove_vesting(env: &Env, donor: &Address) {
+    env.storage().persistent().remove(&vesting_key(donor));
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
@@ -896,6 +904,7 @@ impl PaymentContract {
         env: Env,
         admin: Address,
         donor: Address,
+        reward_token: Address,
         total_amount: i128,
         cliff_secs: u64,
         duration_secs: u64,
@@ -919,12 +928,32 @@ impl PaymentContract {
             return Err(Error::InvalidAmount);
         }
 
+        if load_vesting(&env, &donor).is_some() {
+            return Err(Error::ActiveVestingExists);
+        }
+
+        let token_client = token::Client::new(&env, &reward_token);
+        token_client.transfer(&admin, &env.current_contract_address(), &total_amount);
+
+        let current_outstanding: i128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_OUTSTANDING_VESTING)
+            .unwrap_or(0i128);
+        env.storage()
+            .instance()
+            .set(&TOTAL_OUTSTANDING_VESTING, &current_outstanding.checked_add(total_amount).unwrap_or(current_outstanding));
+
         let now = env.ledger().timestamp();
+        let cliff_timestamp = now.checked_add(cliff_secs).unwrap_or(now);
+        let vest_end_timestamp = now.checked_add(duration_secs).unwrap_or(now);
+
         let schedule = VestingSchedule {
             donor: donor.clone(),
+            reward_token: reward_token.clone(),
             total_amount,
-            cliff_timestamp: now + cliff_secs,
-            vest_end_timestamp: now + duration_secs,
+            cliff_timestamp,
+            vest_end_timestamp,
             claimed: 0,
         };
 
@@ -932,7 +961,7 @@ impl PaymentContract {
 
         env.events().publish(
             (symbol_short!("vest"), symbol_short!("created")),
-            (donor, total_amount, now + cliff_secs, now + duration_secs),
+            (donor, total_amount, cliff_timestamp, vest_end_timestamp),
         );
 
         Ok(())
@@ -944,6 +973,10 @@ impl PaymentContract {
 
         let mut schedule = load_vesting(&env, &donor).ok_or(Error::VestingNotFound)?;
 
+        if reward_token != schedule.reward_token {
+            return Err(Error::Unauthorized);
+        }
+
         let now = env.ledger().timestamp();
 
         if now < schedule.cliff_timestamp {
@@ -953,23 +986,39 @@ impl PaymentContract {
         let vested = if now >= schedule.vest_end_timestamp {
             schedule.total_amount
         } else {
-            let elapsed = now - schedule.cliff_timestamp;
-            let duration = schedule.vest_end_timestamp - schedule.cliff_timestamp;
-            (schedule.total_amount * elapsed as i128) / duration as i128
+            let elapsed = now.checked_sub(schedule.cliff_timestamp).unwrap_or(0);
+            let duration = schedule.vest_end_timestamp.checked_sub(schedule.cliff_timestamp).unwrap_or(1);
+            (schedule.total_amount.checked_mul(elapsed as i128).unwrap_or(0))
+                .checked_div(duration as i128)
+                .unwrap_or(0)
         };
 
-        let claimable = vested - schedule.claimed;
+        let claimable = vested.checked_sub(schedule.claimed).unwrap_or(0);
         if claimable <= 0 {
             return Err(Error::NothingToClaim);
         }
 
-        let new_claimed = schedule.claimed + claimable;
+        let new_claimed = schedule.claimed.checked_add(claimable).unwrap_or(schedule.claimed);
         if new_claimed > schedule.total_amount {
             return Err(Error::NothingToClaim);
         }
 
+        let current_outstanding: i128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_OUTSTANDING_VESTING)
+            .unwrap_or(0i128);
+        env.storage()
+            .instance()
+            .set(&TOTAL_OUTSTANDING_VESTING, &current_outstanding.checked_sub(claimable).unwrap_or(0i128));
+
         schedule.claimed = new_claimed;
-        store_vesting(&env, &schedule);
+        
+        if schedule.claimed == schedule.total_amount {
+            remove_vesting(&env, &donor);
+        } else {
+            store_vesting(&env, &schedule);
+        }
 
         let token_client = token::Client::new(&env, &reward_token);
         token_client.transfer(&env.current_contract_address(), &donor, &claimable);
