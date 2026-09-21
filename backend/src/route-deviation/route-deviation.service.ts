@@ -1,6 +1,10 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectRepository } from '@nestjs/typeorm';
+
+import { Redis } from 'ioredis';
+
+import { REDIS_CLIENT } from '../redis/redis.constants';
 
 import { Repository } from 'typeorm';
 
@@ -17,6 +21,7 @@ import {
   DeviationStatus,
   RouteDeviationIncidentEntity,
 } from './entities/route-deviation-incident.entity';
+import { PaginatedResponse } from '../common/interfaces/paginated-response.interface';
 
 /** Decode a Google-encoded polyline into lat/lng pairs. */
 function decodePolyline(encoded: string): Array<{ lat: number; lng: number }> {
@@ -73,6 +78,24 @@ function minDistanceToPolylineM(
   return minDist;
 }
 
+const TELEMETRY_WINDOW_SIZE = 5;
+const ENTRY_HYSTERESIS_FACTOR = 1.1;
+const EXIT_HYSTERESIS_FACTOR = 0.9;
+
+interface TelemetrySample {
+  latitude: number;
+  longitude: number;
+  distanceM: number;
+  recordedAt: Date;
+}
+
+interface OffCorridorState {
+  firstOffAt: Date;
+  lastDistanceM: number;
+  smoothedDistanceM: number;
+  sampleCount: number;
+}
+
 function pointToSegmentDistanceM(
   pLat: number,
   pLng: number,
@@ -120,11 +143,7 @@ function recommendedAction(severity: DeviationSeverity): string {
 export class RouteDeviationService {
   private readonly logger = new Logger(RouteDeviationService.name);
 
-  /** riderId → { firstOffAt: Date, lastDistanceM: number } */
-  private readonly offCorridorState = new Map<
-    string,
-    { firstOffAt: Date; lastDistanceM: number }
-  >();
+  private readonly telemetryBuffers = new Map<string, TelemetrySample[]>();
 
   constructor(
     @InjectRepository(PlannedRouteEntity)
@@ -132,7 +151,35 @@ export class RouteDeviationService {
     @InjectRepository(RouteDeviationIncidentEntity)
     private readonly incidentRepo: Repository<RouteDeviationIncidentEntity>,
     private readonly eventEmitter: EventEmitter2,
-  ) {}
+    private readonly featureExtractor: SeverityFeatureExtractorService,
+    private readonly classifier: SeverityClassifierService,
+    private readonly triageAutomation: TriageAutomationService,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+  ) { }
+
+  private offCorridorKey(riderId: string): string {
+    return `route-deviation:off-corridor:${riderId}`;
+  }
+
+  private async getOffCorridorState(riderId: string): Promise<OffCorridorState | null> {
+    const raw = await this.redis.get(this.offCorridorKey(riderId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return { ...parsed, firstOffAt: new Date(parsed.firstOffAt) };
+  }
+
+  private async setOffCorridorState(riderId: string, state: OffCorridorState): Promise<void> {
+    await this.redis.set(
+      this.offCorridorKey(riderId),
+      JSON.stringify({ ...state, firstOffAt: state.firstOffAt.toISOString() }),
+      'EX',
+      600,
+    );
+  }
+
+  private async deleteOffCorridorState(riderId: string): Promise<void> {
+    await this.redis.del(this.offCorridorKey(riderId));
+  }
 
   // ── Planned route management ─────────────────────────────────────────
 
@@ -183,20 +230,32 @@ export class RouteDeviationService {
       polylinePoints,
     );
 
-    if (distanceM <= route.corridorRadiusM) {
-      // Back on corridor — clear off-corridor state
-      this.offCorridorState.delete(dto.riderId);
+    const telemetry = this.appendTelemetrySample(dto.riderId, dto, distanceM);
+    const smoothedDistanceM = this.computeSmoothedDistance(telemetry);
+    const jitterM = this.computeJitterM(telemetry);
+    const entryThresholdM = route.corridorRadiusM * ENTRY_HYSTERESIS_FACTOR;
+    const exitThresholdM = route.corridorRadiusM * EXIT_HYSTERESIS_FACTOR;
+
+    if (smoothedDistanceM <= exitThresholdM) {
+      // Back on corridor — clear off-corridor state once the smoothed path settles.
+      await this.deleteOffCorridorState(dto.riderId);
       return;
     }
 
-    // Off corridor
+    if (smoothedDistanceM <= entryThresholdM) {
+      // Temporary excursion inside the hysteresis band — keep collecting samples.
+      return;
+    }
+
     const now = new Date();
-    const existing = this.offCorridorState.get(dto.riderId);
+    const existing = await this.getOffCorridorState(dto.riderId);
 
     if (!existing) {
-      this.offCorridorState.set(dto.riderId, {
+      await this.setOffCorridorState(dto.riderId, {
         firstOffAt: now,
         lastDistanceM: distanceM,
+        smoothedDistanceM,
+        sampleCount: telemetry.length,
       });
       return; // First off-corridor ping — wait for duration threshold
     }
@@ -204,12 +263,27 @@ export class RouteDeviationService {
     const durationS = Math.floor(
       (now.getTime() - existing.firstOffAt.getTime()) / 1000,
     );
-    this.offCorridorState.set(dto.riderId, {
+    await this.setOffCorridorState(dto.riderId, {
       firstOffAt: existing.firstOffAt,
       lastDistanceM: distanceM,
+      smoothedDistanceM,
+      sampleCount: telemetry.length,
     });
 
     if (durationS < route.maxDeviationSeconds) return; // Not yet past duration threshold
+
+    const confidenceScore = this.computeConfidenceScore({
+      smoothedDistanceM,
+      routeRadiusM: route.corridorRadiusM,
+      durationS,
+      maxDeviationSeconds: route.maxDeviationSeconds,
+      jitterM,
+      sampleCount: telemetry.length,
+    });
+
+    if (confidenceScore < 0.55 && durationS < route.maxDeviationSeconds * 2) {
+      return;
+    }
 
     // Check if there's already an open incident for this rider+order
     const openIncident = await this.incidentRepo.findOne({
@@ -246,16 +320,35 @@ export class RouteDeviationService {
       deviationDurationS: durationS,
       lastKnownLatitude: dto.latitude,
       lastKnownLongitude: dto.longitude,
-      reason: `Rider deviated ${Math.round(distanceM)}m from planned corridor for ${durationS}s`,
+      reason: `Rider deviated ${Math.round(smoothedDistanceM)}m from planned corridor for ${durationS}s`,
       recommendedAction: action,
       acknowledgedBy: null,
       acknowledgedAt: null,
       resolvedAt: null,
       scoringApplied: false,
-      metadata: null,
+      metadata: {
+        rawDistanceM: Math.round(distanceM * 100) / 100,
+        smoothedDistanceM: Math.round(smoothedDistanceM * 100) / 100,
+        jitterM: Math.round(jitterM * 100) / 100,
+        sampleCount: telemetry.length,
+        confidenceScore: Math.round(confidenceScore * 100) / 100,
+        telemetryWindow: telemetry.map((sample) => ({
+          latitude: sample.latitude,
+          longitude: sample.longitude,
+          distanceM: Math.round(sample.distanceM * 100) / 100,
+          recordedAt: sample.recordedAt.toISOString(),
+        })),
+      },
     });
 
     const saved = await this.incidentRepo.save(incident);
+
+    // Apply advanced severity classification and triage
+    await this.classifyAndTriageDeviation(saved, {
+      orderPriority: 'STANDARD', // TODO: Get from order context
+      hasColdChainRequirement: false, // TODO: Get from order context
+    });
+
     this.logger.warn(
       `Route deviation incident created id=${saved.id} order=${dto.orderId} severity=${severity}`,
     );
@@ -267,10 +360,17 @@ export class RouteDeviationService {
         dto.orderId,
         dto.riderId,
         severity,
-        distanceM,
+        smoothedDistanceM,
         dto.latitude,
         dto.longitude,
         action,
+        confidenceScore,
+        {
+          rawDistanceM: distanceM,
+          smoothedDistanceM,
+          jitterM,
+          sampleCount: telemetry.length,
+        },
       ),
     );
   }
@@ -306,15 +406,33 @@ export class RouteDeviationService {
 
     incident.status = DeviationStatus.RESOLVED;
     incident.resolvedAt = new Date();
-    this.offCorridorState.delete(incident.riderId);
+    await this.deleteOffCorridorState(incident.riderId);
     return this.incidentRepo.save(incident);
   }
 
-  async findOpenIncidents(): Promise<RouteDeviationIncidentEntity[]> {
-    return this.incidentRepo.find({
+  async findOpenIncidents(
+    page = 1,
+    pageSize = 20,
+  ): Promise<PaginatedResponse<RouteDeviationIncidentEntity>> {
+    const take = Math.min(Math.max(pageSize, 1), 100);
+    const skip = (Math.max(page, 1) - 1) * take;
+
+    const [data, total] = await this.incidentRepo.findAndCount({
       where: { status: DeviationStatus.OPEN },
       order: { createdAt: 'DESC' },
+      take,
+      skip,
     });
+
+    return {
+      data,
+      meta: {
+        total,
+        page: Math.max(page, 1),
+        pageSize: take,
+        totalPages: Math.ceil(total / take),
+      },
+    };
   }
 
   async findIncidentsByOrder(
@@ -328,5 +446,219 @@ export class RouteDeviationService {
 
   async markScoringApplied(incidentId: string): Promise<void> {
     await this.incidentRepo.update(incidentId, { scoringApplied: true });
+  }
+
+  // ── Advanced Severity Classification & Triage ───────────────────────
+
+  /**
+   * Apply advanced severity classification and triage automation
+   */
+  async classifyAndTriageDeviation(
+    incident: RouteDeviationIncidentEntity,
+    context: {
+      orderPriority?: 'CRITICAL' | 'URGENT' | 'STANDARD';
+      hasColdChainRequirement?: boolean;
+      currentTemperature?: number;
+      temperatureThreshold?: number;
+      trafficCondition?: 'CLEAR' | 'MODERATE' | 'HEAVY' | 'UNKNOWN';
+      trafficDelayMinutes?: number;
+      riderReliabilityScore?: number;
+    } = {},
+  ): Promise<void> {
+    try {
+      // Extract features
+      const features = await this.featureExtractor.extractFeatures(
+        incident,
+        context,
+      );
+
+      // Classify severity
+      const classification = this.classifier.classify(features);
+
+      // Update incident with classification results
+      await this.incidentRepo.update(incident.id, {
+        severity: classification.severity,
+        recommendedAction: classification.explanation,
+        metadata: {
+          ...incident.metadata,
+          classification: {
+            riskScore: classification.riskScore,
+            confidence: classification.confidence,
+            contributingFactors: classification.contributingFactors,
+            timestamp: new Date().toISOString(),
+          },
+        },
+      });
+
+      // Execute triage automation
+      const triageResult = await this.triageAutomation.executeTriage(
+        incident,
+        classification,
+        {
+          orderPriority: context.orderPriority,
+          hasColdChainRequirement: context.hasColdChainRequirement,
+          riderDeviationHistory: features.riderDeviationHistory,
+        },
+      );
+
+      this.logger.log(
+        `Classified and triaged deviation ${incident.id}: severity=${classification.severity}, risk=${classification.riskScore}, actions=${triageResult.actions.length}`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Failed to classify and triage deviation ${incident.id}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Reclassify an existing deviation with updated context
+   */
+  async reclassifyDeviation(
+    incidentId: string,
+    context: {
+      orderPriority?: 'CRITICAL' | 'URGENT' | 'STANDARD';
+      hasColdChainRequirement?: boolean;
+      currentTemperature?: number;
+      temperatureThreshold?: number;
+      trafficCondition?: 'CLEAR' | 'MODERATE' | 'HEAVY' | 'UNKNOWN';
+      trafficDelayMinutes?: number;
+      riderReliabilityScore?: number;
+    },
+  ): Promise<void> {
+    const incident = await this.incidentRepo.findOne({
+      where: { id: incidentId },
+    });
+
+    if (!incident) {
+      throw new NotFoundException(`Deviation incident ${incidentId} not found`);
+    }
+
+    await this.classifyAndTriageDeviation(incident, context);
+  }
+
+  /**
+   * Override severity with operator rationale
+   */
+  async overrideSeverity(
+    incidentId: string,
+    newSeverity: DeviationSeverity,
+    operatorId: string,
+    rationale: string,
+  ): Promise<RouteDeviationIncidentEntity> {
+    await this.triageAutomation.overrideSeverity(
+      incidentId,
+      newSeverity,
+      operatorId,
+      rationale,
+    );
+
+    return this.incidentRepo.findOne({ where: { id: incidentId } })!;
+  }
+
+  /**
+   * Validate classification against historical annotated data
+   */
+  async validateClassification(
+    incidentId: string,
+    actualSeverity: DeviationSeverity,
+  ): Promise<{
+    correct: boolean;
+    error: number;
+    feedback: string;
+  }> {
+    const incident = await this.incidentRepo.findOne({
+      where: { id: incidentId },
+    });
+
+    if (!incident) {
+      throw new NotFoundException(`Deviation incident ${incidentId} not found`);
+    }
+
+    const features = await this.featureExtractor.extractFeatures(incident);
+    const classification = this.classifier.classify(features);
+
+    return this.classifier.validateClassification(
+      classification.severity,
+      actualSeverity,
+      features,
+    );
+  }
+
+  /**
+   * Get triage statistics
+   */
+  async getTriageStatistics(params: {
+    startDate?: Date;
+    endDate?: Date;
+  }): Promise<{
+    totalDeviations: number;
+    bySeverity: Record<DeviationSeverity, number>;
+    overrideCount: number;
+    overrideRate: number;
+  }> {
+    return this.triageAutomation.getTriageStatistics(params);
+  }
+
+  // ── Private Helper Methods ──────────────────────────────────────────
+
+  private appendTelemetrySample(
+    riderId: string,
+    dto: LocationUpdateDto,
+    distanceM: number,
+  ): TelemetrySample[] {
+    const samples = this.telemetryBuffers.get(riderId) ?? [];
+    samples.push({
+      latitude: dto.latitude,
+      longitude: dto.longitude,
+      distanceM,
+      recordedAt: new Date(),
+    });
+    const trimmed = samples.slice(-TELEMETRY_WINDOW_SIZE);
+    this.telemetryBuffers.set(riderId, trimmed);
+    return trimmed;
+  }
+
+  private computeSmoothedDistance(samples: TelemetrySample[]): number {
+    if (samples.length === 0) return 0;
+    const total = samples.reduce((sum, sample) => sum + sample.distanceM, 0);
+    return total / samples.length;
+  }
+
+  private computeJitterM(samples: TelemetrySample[]): number {
+    if (samples.length <= 1) return 0;
+    const distances = samples.map((sample) => sample.distanceM);
+    return Math.max(...distances) - Math.min(...distances);
+  }
+
+  private computeConfidenceScore(input: {
+    smoothedDistanceM: number;
+    routeRadiusM: number;
+    durationS: number;
+    maxDeviationSeconds: number;
+    jitterM: number;
+    sampleCount: number;
+  }): number {
+    const distanceScore = Math.max(
+      0,
+      Math.min(1, (input.smoothedDistanceM - input.routeRadiusM) / input.routeRadiusM),
+    );
+    const durationScore = Math.max(
+      0,
+      Math.min(1, input.durationS / Math.max(input.maxDeviationSeconds * 2, 60)),
+    );
+    const stabilityScore = Math.max(
+      0,
+      Math.min(1, 1 - input.jitterM / Math.max(input.routeRadiusM * 2, 1)),
+    );
+    const sampleBonus = Math.max(0, Math.min(1, input.sampleCount / TELEMETRY_WINDOW_SIZE));
+
+    return (
+      0.4 * distanceScore +
+      0.3 * durationScore +
+      0.2 * stabilityScore +
+      0.1 * sampleBonus
+    );
   }
 }

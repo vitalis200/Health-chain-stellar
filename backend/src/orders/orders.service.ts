@@ -1,18 +1,30 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 
-import { PaginatedResponse, PaginationUtil } from '../common/pagination';
 import {
-  OrderDisputedEvent,
+  PaginatedResponse,
+  PaginationQueryDto,
+  PaginationUtil,
+} from '../common/pagination';
+import { OrgVerificationLifecycleService } from '../organizations/services/org-verification-lifecycle.service';
+import { RestrictionLevel } from '../organizations/enums/org-lifecycle.enum';
+import {
+  OrderConfirmedEvent,
+  OrderCancelledEvent,
+  OrderStatusUpdatedEvent,
   OrderRiderAssignedEvent,
+  OrderDispatchedEvent,
+  OrderInTransitEvent,
+  OrderDeliveredEvent,
+  OrderDisputedEvent,
   OrderResolvedEvent,
 } from '../events';
 import { InventoryService } from '../inventory/inventory.service';
@@ -22,6 +34,7 @@ import { SlaService } from '../sla/sla.service';
 import { SlaStage } from '../sla/enums/sla-stage.enum';
 
 import { CreateOrderDto } from './dto/create-order.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
 import { OrderQueryParamsDto } from './dto/order-query-params.dto';
 import { RaiseDisputeDto } from './dto/raise-dispute.dto';
 import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
@@ -37,6 +50,14 @@ import { OrderEventStoreService } from './services/order-event-store.service';
 import { OrderFeeService } from './services/order-fee.service';
 import { RequestStatusService } from './services/request-status.service';
 import { FeePreviewDto } from '../fee-policy/dto/fee-policy.dto';
+import {
+  TenantActorContext,
+  assertTenantAccess,
+} from '../common/tenant/tenant-scope.util';
+import {
+  SecurityEventLoggerService,
+  SecurityEventType,
+} from '../user-activity/security-event-logger.service';
 
 @Injectable()
 export class OrdersService {
@@ -48,24 +69,37 @@ export class OrdersService {
     private readonly orderRepo: Repository<OrderEntity>,
     private readonly stateMachine: OrderStateMachine,
     private readonly eventStore: OrderEventStoreService,
-    private readonly eventEmitter: EventEmitter2,
     private readonly inventoryService: InventoryService,
     private readonly requestStatusService: RequestStatusService,
     private readonly orderFeeService: OrderFeeService,
+    private readonly orgVerificationLifecycleService: OrgVerificationLifecycleService,
     private readonly approvalService: ApprovalService,
     private readonly slaService: SlaService,
+    private readonly outboxService: OutboxService,
+    private readonly securityEventLogger: SecurityEventLoggerService,
   ) {}
 
-  async findAll(status?: string, hospitalId?: string) {
+  async findAll(
+    status?: string,
+    hospitalId?: string,
+    pagination: PaginationQueryDto = {},
+  ): Promise<PaginatedResponse<OrderEntity>> {
+    const { page = 1, pageSize = 25 } = pagination;
     const where: Partial<OrderEntity> = {};
     if (status) where.status = status as OrderStatus;
     if (hospitalId) where.hospitalId = hospitalId;
-    const orders = await this.orderRepo.find({ where });
-    return { message: 'Orders retrieved successfully', data: orders };
+    const [orders, totalCount] = await this.orderRepo.findAndCount({
+      where,
+      order: { placedAt: 'DESC' },
+      take: pageSize,
+      skip: PaginationUtil.calculateSkip(page, pageSize),
+    });
+    return PaginationUtil.createResponse(orders, page, pageSize, totalCount);
   }
 
   async findAllWithFilters(
     params: OrderQueryParamsDto,
+    actor?: TenantActorContext,
   ): Promise<PaginatedResponse<Order>> {
     const {
       hospitalId,
@@ -74,12 +108,21 @@ export class OrdersService {
       sortBy = 'placedAt',
       sortOrder = 'desc',
     } = params;
+    const scopedHospitalId =
+      actor?.organizationId && (actor.role ?? '').toLowerCase() !== 'admin'
+        ? actor.organizationId
+        : hospitalId;
+
     const query = this.orderRepo
       .createQueryBuilder('order')
-      .where('order.hospitalId = :hospitalId', { hospitalId });
+      .where('order.hospitalId = :hospitalId', {
+        hospitalId: scopedHospitalId,
+      });
 
     if (params.startDate)
-      query.andWhere('order.placedAt >= :startDate', { startDate: params.startDate });
+      query.andWhere('order.placedAt >= :startDate', {
+        startDate: params.startDate,
+      });
     if (params.endDate)
       query.andWhere('order.placedAt <= :endDate', { endDate: params.endDate });
 
@@ -92,13 +135,13 @@ export class OrdersService {
     return PaginationUtil.createResponse(items as any, page, pageSize, total);
   }
 
-  async findOne(id: string) {
-    const order = await this.findOrderOrFail(id);
+  async findOne(id: string, actor?: TenantActorContext) {
+    const order = await this.findOrderOrFail(id, actor);
     return { message: 'Order retrieved successfully', data: order };
   }
 
-  async trackOrder(id: string) {
-    const order = await this.findOrderOrFail(id);
+  async trackOrder(id: string, actor?: TenantActorContext) {
+    const order = await this.findOrderOrFail(id, actor);
     const replayedStatus = await this.eventStore.replayOrderState(id);
     return {
       message: 'Order tracking information retrieved successfully',
@@ -106,13 +149,26 @@ export class OrdersService {
     };
   }
 
-  async getOrderHistory(orderId: string): Promise<OrderEventEntity[]> {
-    await this.findOrderOrFail(orderId);
+  async getOrderHistory(
+    orderId: string,
+    actor?: TenantActorContext,
+  ): Promise<OrderEventEntity[]> {
+    await this.findOrderOrFail(orderId, actor);
     return this.eventStore.getOrderHistory(orderId);
   }
 
   async create(dto: CreateOrderDto, actorId?: string) {
-    if (!dto.bloodBankId) throw new BadRequestException('bloodBankId is required');
+    if (!dto.bloodBankId)
+      throw new BadRequestException('bloodBankId is required');
+    const restriction =
+      await this.orgVerificationLifecycleService.getRestrictionLevel(
+        dto.hospitalId,
+      );
+    if (restriction !== RestrictionLevel.NONE) {
+      throw new ForbiddenException(
+        'This hospital is restricted from creating new orders',
+      );
+    }
     const saved = await this.createOrderEntity(dto, actorId);
     if (
       saved.status === OrderStatus.CONFIRMED ||
@@ -123,9 +179,15 @@ export class OrdersService {
     return { message: 'Order created successfully', data: saved };
   }
 
-  async update(id: string, updateDto: any) {
-    const order = await this.findOrderOrFail(id);
-    Object.assign(order, updateDto);
+  async update(
+    id: string,
+    updateDto: UpdateOrderDto,
+    actor?: TenantActorContext,
+  ) {
+    const order = await this.findOrderOrFail(id, actor);
+    if (updateDto.deliveryAddress !== undefined)
+      order.deliveryAddress = updateDto.deliveryAddress;
+    if (updateDto.quantity !== undefined) order.quantity = updateDto.quantity;
     const updated = await this.orderRepo.save(order);
     return { message: 'Order updated successfully', data: updated };
   }
@@ -135,12 +197,13 @@ export class OrdersService {
     statusUpdate: UpdateRequestStatusDto | string,
     actorId?: string,
     actorRole?: string,
+    actor?: TenantActorContext,
   ) {
     const dto =
       typeof statusUpdate === 'string'
         ? { status: statusUpdate as OrderStatus }
         : statusUpdate;
-    const order = await this.findOrderOrFail(id);
+    const order = await this.findOrderOrFail(id, actor);
     const updated = await this.dataSource.transaction(async (manager) => {
       await this.requestStatusService.applyStatusUpdate(
         order,
@@ -154,8 +217,8 @@ export class OrdersService {
     return { message: 'Order status updated successfully', data: updated };
   }
 
-  async remove(id: string, actorId?: string) {
-    const order = await this.findOrderOrFail(id);
+  async remove(id: string, actorId?: string, actor?: TenantActorContext) {
+    const order = await this.findOrderOrFail(id, actor);
     await this.dataSource.transaction(async (manager) => {
       await this.requestStatusService.applyStatusUpdate(
         order,
@@ -169,14 +232,28 @@ export class OrdersService {
     return { message: 'Order cancelled successfully', data: { id } };
   }
 
-  async assignRider(orderId: string, riderId: string, actorId?: string) {
-    const order = await this.findOrderOrFail(orderId);
-    order.riderId = riderId;
-    await this.orderRepo.save(order);
-    this.eventEmitter.emit(
-      'order.rider.assigned',
-      new OrderRiderAssignedEvent(orderId, riderId),
-    );
+  async assignRider(
+    orderId: string,
+    riderId: string,
+    actorId?: string,
+    actor?: TenantActorContext,
+  ) {
+    const order = await this.findOrderOrFail(orderId, actor);
+    await this.dataSource.transaction(async (manager) => {
+      order.riderId = riderId;
+      this.stateMachine.transition(
+        order.status as OrderStatus,
+        OrderStatus.DISPATCHED,
+      );
+      order.status = OrderStatus.DISPATCHED;
+      await manager.save(OrderEntity, order);
+      await this.outboxService.publishInTransaction(
+        manager,
+        OutboxEventType.ORDER_DISPATCHED,
+        { orderId, riderId, actorId: actorId ?? null },
+        { aggregateId: orderId, aggregateType: 'Order' },
+      );
+    });
     await this.slaService
       .startStage(orderId, SlaStage.DISPATCH_ACCEPTANCE, {
         hospitalId: order.hospitalId,
@@ -184,39 +261,70 @@ export class OrdersService {
         riderId,
       })
       .catch((err) =>
-        this.logger.error(`SLA DISPATCH_ACCEPTANCE start failed: ${err.message}`),
+        this.logger.error(
+          `SLA DISPATCH_ACCEPTANCE start failed: ${err.message}`,
+        ),
       );
-    return { message: 'Rider assigned successfully', data: { orderId, riderId } };
+    return {
+      message: 'Rider assigned successfully',
+      data: { orderId, riderId },
+    };
   }
 
-  async raiseDispute(id: string, dto: RaiseDisputeDto, actorId?: string) {
-    const order = await this.findOrderOrFail(id);
-    this.stateMachine.transition(order.status as OrderStatus, OrderStatus.DISPUTED);
+  async raiseDispute(
+    id: string,
+    dto: RaiseDisputeDto,
+    actorId?: string,
+    actor?: TenantActorContext,
+  ) {
+    const order = await this.findOrderOrFail(id, actor);
+    this.stateMachine.transition(
+      order.status as OrderStatus,
+      OrderStatus.DISPUTED,
+    );
     order.status = OrderStatus.DISPUTED;
     order.disputeId = dto.disputeId || `DISP-${id.split('-')[0]}-${Date.now()}`;
     order.disputeReason = dto.reason;
-    const saved = await this.orderRepo.save(order);
-    await this.eventStore.persistEvent({
-      orderId: id,
-      eventType: OrderEventType.ORDER_DISPUTED,
-      payload: { reason: dto.reason, disputeId: order.disputeId },
-      actorId,
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const s = await manager.save(OrderEntity, order);
+      await this.eventStore.persistEvent({
+        orderId: id,
+        eventType: OrderEventType.ORDER_DISPUTED,
+        payload: { reason: dto.reason, disputeId: order.disputeId },
+        actorId,
+      });
+      await this.outboxService.publishInTransaction(
+        manager,
+        OutboxEventType.ORDER_DISPUTED,
+        {
+          orderId: id,
+          disputeId: order.disputeId,
+          reason: dto.reason,
+          actorId: actorId ?? null,
+        },
+        { aggregateId: id, aggregateType: 'Order' },
+      );
+      return s;
     });
-    this.eventEmitter.emit(
-      'order.disputed',
-      new OrderDisputedEvent(id, order.disputeId, dto.reason),
-    );
     return { message: 'Dispute raised successfully', data: saved };
   }
 
-  async resolveDispute(id: string, dto: ResolveDisputeDto, actorId?: string) {
-    const order = await this.findOrderOrFail(id);
+  async resolveDispute(
+    id: string,
+    dto: ResolveDisputeDto,
+    actorId?: string,
+    actor?: TenantActorContext,
+  ) {
+    if (!actorId) {
+      throw new BadRequestException('actorId is required to resolve a dispute');
+    }
+    const order = await this.findOrderOrFail(id, actor);
     if (order.status !== OrderStatus.DISPUTED)
       throw new ConflictException('Order is not in DISPUTED state');
     const approvalRequest = await this.approvalService.createRequest({
       targetId: id,
       actionType: ApprovalActionType.DISPUTE_RESOLUTION,
-      requesterId: actorId!,
+      requesterId: actorId,
       requiredApprovals: 2,
       metadata: { orderId: id, resolution: dto.resolution },
       finalPayload: { ...dto, orderId: id },
@@ -227,22 +335,37 @@ export class OrdersService {
     };
   }
 
-  async finalizeDisputeResolution(id: string, resolution: any) {
-    const order = await this.findOrderOrFail(id);
-    order.status = OrderStatus.RESOLVED;
-    await this.orderRepo.save(order);
-    await this.eventStore.persistEvent({
-      orderId: id,
-      eventType: OrderEventType.ORDER_RESOLVED,
-      payload: { resolution },
-      actorId: 'SYSTEM_APPROVAL',
+  async finalizeDisputeResolution(
+    id: string,
+    resolution: any,
+    actor?: TenantActorContext,
+  ) {
+    const order = await this.findOrderOrFail(id, actor);
+    await this.dataSource.transaction(async (manager) => {
+      order.status = OrderStatus.RESOLVED;
+      await manager.save(OrderEntity, order);
+      await this.eventStore.persistEvent({
+        orderId: id,
+        eventType: OrderEventType.ORDER_RESOLVED,
+        payload: { resolution },
+        actorId: 'SYSTEM_APPROVAL',
+      });
+      await this.outboxService.publishInTransaction(
+        manager,
+        OutboxEventType.ORDER_RESOLVED,
+        { orderId: id, resolution },
+        { aggregateId: id, aggregateType: 'Order' },
+      );
     });
-    this.eventEmitter.emit('order.resolved', new OrderResolvedEvent(id, resolution));
     return { message: 'Dispute resolution finalized and settled.' };
   }
 
-  async previewOrderFees(id: string, overrides: Partial<FeePreviewDto>) {
-    const order = await this.findOrderOrFail(id);
+  async previewOrderFees(
+    id: string,
+    overrides: Partial<FeePreviewDto>,
+    actor?: TenantActorContext,
+  ) {
+    const order = await this.findOrderOrFail(id, actor);
     return this.orderFeeService.preview(order, overrides);
   }
 
@@ -281,9 +404,35 @@ export class OrdersService {
     return saved;
   }
 
-  private async findOrderOrFail(id: string): Promise<OrderEntity> {
+  private async findOrderOrFail(
+    id: string,
+    actor?: TenantActorContext,
+  ): Promise<OrderEntity> {
     const order = await this.orderRepo.findOne({ where: { id } });
     if (!order) throw new NotFoundException(`Order '${id}' not found`);
+    if (actor) {
+      try {
+        assertTenantAccess(actor, {
+          resourceType: 'Order',
+          resourceId: id,
+          ownerIds: [order.hospitalId, order.bloodBankId],
+        });
+      } catch {
+        await this.securityEventLogger
+          .logEvent({
+            eventType: SecurityEventType.TENANT_ACCESS_DENIED,
+            userId: actor.userId,
+            description: 'Cross-tenant order access denied',
+            metadata: {
+              orderId: id,
+              hospitalId: order.hospitalId,
+              bloodBankId: order.bloodBankId,
+            },
+          })
+          .catch(() => undefined);
+        throw new ForbiddenException('Cross-tenant order access denied');
+      }
+    }
     return order;
   }
 }

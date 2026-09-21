@@ -42,7 +42,8 @@ import {
   VerifyEmailDto,
 } from './dto/auth.dto';
 import { Permission } from './enums/permission.enum';
-import { IsNotEmpty, IsString } from 'class-validator';
+import { IsNotEmpty, IsString, IsOptional, IsIn } from 'class-validator';
+import { RiskLevel } from './session-risk.service';
 
 export class MfaExchangeDto {
   @IsString()
@@ -117,6 +118,7 @@ export class AuthController {
   }
 
   @Public()
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @UseInterceptors(IdempotencyInterceptor)
   @Post('login')
   @HttpCode(HttpStatus.OK)
@@ -324,6 +326,23 @@ export class AuthController {
     @Param('sessionId') sessionId: string,
   ) {
     return this.authService.revokeSession(req.user.id, sessionId);
+  }
+
+  @Post('sessions/:sessionId/risk-revoke')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Revoke a session if its risk level meets the threshold',
+    description: 'Scores the session risk and revokes it if at or above the specified level',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID to evaluate' })
+  @ApiQuery({ name: 'minLevel', enum: RiskLevel, required: false, description: 'Minimum risk level to trigger revocation (default: high)' })
+  async revokeIfRisky(
+    @Request() req: any,
+    @Param('sessionId') sessionId: string,
+    @Query('minLevel') minLevel?: RiskLevel,
+  ) {
+    return this.authService.revokeIfRisky(req.user.id, sessionId, minLevel ?? RiskLevel.HIGH);
   }
 
   @UseInterceptors(IdempotencyInterceptor)

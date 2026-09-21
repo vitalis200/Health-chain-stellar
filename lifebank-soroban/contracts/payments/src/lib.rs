@@ -1,9 +1,11 @@
 #![no_std]
+#![deny(deprecated)]
+
+use soroban_sdk::token;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env,
     String, Vec,
 };
-use soroban_sdk::token;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -46,6 +48,15 @@ pub struct Payment {
     pub dispute_resolved: bool,
     /// Token contract address — set only for escrow-backed payments.
     pub token: Option<Address>,
+}
+
+/// Direction for dispute resolution — determines whether escrowed funds
+/// are released to the payee or refunded to the payer.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisputeResolution {
+    ReleaseToPayee,
+    RefundToPayer,
 }
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
@@ -124,8 +135,12 @@ pub enum Error {
     NothingToClaim = 510,
     /// A payment already exists for this request.
     DuplicatePayment = 511,
+    /// Donor already has an active vesting schedule that has not been fully claimed.
+    ActiveVestingExists = 517,
     /// The associated request is not in a state that permits payment.
     RequestNotPayable = 512,
+    /// Payment is not in Disputed status — cannot resolve.
+    PaymentNotDisputed = 521,
     /// The request referenced by this payment does not exist.
     RequestNotFound = 513,
     /// Payment has no escrowed token — cannot release or refund funds.
@@ -140,6 +155,7 @@ pub enum Error {
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
 
+const CONTRACT_VERSION: u32 = 1;
 const PAYMENT_COUNTER: soroban_sdk::Symbol = symbol_short!("PAY_CTR");
 const PLEDGE_COUNTER: soroban_sdk::Symbol = symbol_short!("PLG_CTR");
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
@@ -154,8 +170,26 @@ const STATS_KEY: soroban_sdk::Symbol = symbol_short!("STATS");
 const REQ_CONTRACT: soroban_sdk::Symbol = symbol_short!("REQ_CTR");
 /// Default dispute auto-refund timeout in seconds (7 days).
 const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
+/// Maximum allowed dispute timeout (365 days). Bounds the value admins can set
+/// so `payment.updated_at + timeout` can never overflow u64.
+const MAX_DISPUTE_TIMEOUT_SECS: u64 = 365 * 24 * 3600;
 /// Instance storage key for the dispute timeout override.
 const DISPUTE_TIMEOUT: soroban_sdk::Symbol = symbol_short!("DISP_TO");
+
+/// Persistent storage TTL constants (in ledgers; one ledger ≈ 5 s).
+/// Entries are bumped to PERSISTENT_BUMP_TO whenever their remaining TTL
+/// falls below PERSISTENT_BUMP_THRESHOLD, preventing silent expiry.
+const PERSISTENT_BUMP_THRESHOLD: u32 = 518_400; // ~30 days
+const PERSISTENT_BUMP_TO: u32 = 1_036_800; // ~60 days
+
+/// Extend instance-storage TTL using the same threshold/extend-to as persistent
+/// writes. Instance storage holds admin/config/stats keys; without an explicit
+/// bump the entire contract instance can archive and become unusable.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+}
 
 fn payment_key(id: u64) -> (u64, &'static str) {
     (id, "pay")
@@ -186,23 +220,37 @@ fn status_index_key(status: PaymentStatus) -> (u32, &'static str) {
 }
 
 fn get_counter(env: &Env) -> u64 {
-    env.storage().instance().get(&PAYMENT_COUNTER).unwrap_or(0u64)
+    extend_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&PAYMENT_COUNTER)
+        .unwrap_or(0u64)
 }
 
 fn set_counter(env: &Env, val: u64) {
     env.storage().instance().set(&PAYMENT_COUNTER, &val);
+    extend_instance_ttl(env);
 }
 
 fn get_pledge_counter(env: &Env) -> u64 {
-    env.storage().instance().get(&PLEDGE_COUNTER).unwrap_or(0u64)
+    extend_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&PLEDGE_COUNTER)
+        .unwrap_or(0u64)
 }
 
 fn set_pledge_counter(env: &Env, val: u64) {
     env.storage().instance().set(&PLEDGE_COUNTER, &val);
+    extend_instance_ttl(env);
 }
 
 fn store_payment(env: &Env, payment: &Payment) {
-    env.storage().persistent().set(&payment_key(payment.id), payment);
+    let key = payment_key(payment.id);
+    env.storage().persistent().set(&key, payment);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 fn load_payment(env: &Env, id: u64) -> Option<Payment> {
@@ -210,7 +258,11 @@ fn load_payment(env: &Env, id: u64) -> Option<Payment> {
 }
 
 fn store_pledge(env: &Env, pledge: &DonationPledge) {
-    env.storage().persistent().set(&pledge_key(pledge.id), pledge);
+    let key = pledge_key(pledge.id);
+    env.storage().persistent().set(&key, pledge);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 fn load_pledge(env: &Env, id: u64) -> Option<DonationPledge> {
@@ -222,9 +274,11 @@ fn vesting_key(donor: &Address) -> (Address, &'static str) {
 }
 
 fn store_vesting(env: &Env, schedule: &VestingSchedule) {
+    let key = vesting_key(&schedule.donor);
+    env.storage().persistent().set(&key, schedule);
     env.storage()
         .persistent()
-        .set(&vesting_key(&schedule.donor), schedule);
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 fn load_vesting(env: &Env, donor: &Address) -> Option<VestingSchedule> {
@@ -239,39 +293,104 @@ fn remove_vesting(env: &Env, donor: &Address) {
 
 fn index_by_payer(env: &Env, payer: &Address, id: u64) {
     let key = payer_index_key(payer);
-    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
     ids.push_back(id);
     env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 fn index_by_payee(env: &Env, payee: &Address, id: u64) {
     let key = payee_index_key(payee);
-    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
     ids.push_back(id);
     env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 fn index_by_status(env: &Env, status: PaymentStatus, id: u64) {
     let key = status_index_key(status);
-    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
     ids.push_back(id);
     env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
+fn req_idx_key(request_id: u64) -> (u64, &'static str) {
+    (request_id, "ri")
+}
+
+/// Store a single request_id → payment_id mapping in persistent storage.
+/// Each entry is independent, preventing unbounded instance-storage growth.
 fn index_by_request(env: &Env, request_id: u64, payment_id: u64) {
-    let mut map: Map<u64, u64> = env
+    env.storage()
+        .persistent()
+        .set(&req_idx_key(request_id), &payment_id);
+}
+
+/// Remove the request index entry once the payment reaches a terminal state
+/// (Released, Refunded, Cancelled) to avoid retaining stale entries.
+fn remove_from_request_index(env: &Env, request_id: u64) {
+    env.storage().persistent().remove(&req_idx_key(request_id));
+}
+
+/// A terminal status is one from which req_idx_key has already been removed;
+/// only Released, Refunded, and Cancelled are terminal.
+fn is_terminal_status(status: PaymentStatus) -> bool {
+    matches!(
+        status,
+        PaymentStatus::Released | PaymentStatus::Refunded | PaymentStatus::Cancelled
+    )
+}
+
+/// Persistent key for the ordered list of payment IDs associated with a request.
+/// Separate from req_idx_key (which maps request → current active payment).
+fn request_timeline_key(request_id: u64) -> (u64, &'static str) {
+    (request_id, "rt")
+}
+
+/// Append `payment_id` to the per-request timeline index.
+/// The list is insertion-ordered; no sort is needed on read because payments
+/// for a given request are appended in creation order.
+fn timeline_append(env: &Env, request_id: u64, payment_id: u64) {
+    let key = request_timeline_key(request_id);
+    let mut ids: Vec<u64> = env
         .storage()
-        .instance()
-        .get(&REQ_IDX)
-        .unwrap_or(Map::new(env));
-    map.set(request_id, payment_id);
-    env.storage().instance().set(&REQ_IDX, &map);
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+    ids.push_back(payment_id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 /// Remove `id` from the persistent Vec stored under the given status index key.
 fn remove_from_status_index(env: &Env, status: PaymentStatus, id: u64) {
     let key = status_index_key(status);
-    let ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
     let mut new_ids: Vec<u64> = Vec::new(env);
     for i in 0..ids.len() {
         let existing = ids.get(i).unwrap();
@@ -285,18 +404,23 @@ fn remove_from_status_index(env: &Env, status: PaymentStatus, id: u64) {
 // ── Stats helpers ──────────────────────────────────────────────────────────────
 
 fn load_stats(env: &Env) -> PaymentStats {
-    env.storage().instance().get(&STATS_KEY).unwrap_or(PaymentStats {
-        total_locked: 0,
-        total_released: 0,
-        total_refunded: 0,
-        count_locked: 0,
-        count_released: 0,
-        count_refunded: 0,
-    })
+    extend_instance_ttl(env);
+    env.storage()
+        .instance()
+        .get(&STATS_KEY)
+        .unwrap_or(PaymentStats {
+            total_locked: 0,
+            total_released: 0,
+            total_refunded: 0,
+            count_locked: 0,
+            count_released: 0,
+            count_refunded: 0,
+        })
 }
 
 fn store_stats(env: &Env, stats: &PaymentStats) {
     env.storage().instance().set(&STATS_KEY, stats);
+    extend_instance_ttl(env);
 }
 
 fn update_stats_on_transition(
@@ -304,7 +428,7 @@ fn update_stats_on_transition(
     amount: i128,
     old: PaymentStatus,
     new: PaymentStatus,
-) {
+) -> Result<(), Error> {
     let mut stats = load_stats(env);
     match old {
         PaymentStatus::Locked => {
@@ -323,44 +447,113 @@ fn update_stats_on_transition(
     }
     match new {
         PaymentStatus::Locked => {
-            stats.total_locked += amount;
+            stats.total_locked = stats
+                .total_locked
+                .checked_add(amount)
+                .ok_or(Error::Overflow)?;
             stats.count_locked += 1;
         }
         PaymentStatus::Released => {
-            stats.total_released += amount;
+            stats.total_released = stats
+                .total_released
+                .checked_add(amount)
+                .ok_or(Error::Overflow)?;
             stats.count_released += 1;
         }
         PaymentStatus::Refunded => {
-            stats.total_refunded += amount;
+            stats.total_refunded = stats
+                .total_refunded
+                .checked_add(amount)
+                .ok_or(Error::Overflow)?;
             stats.count_refunded += 1;
         }
         _ => {}
     }
     store_stats(env, &stats);
+    Ok(())
 }
 
 // ── Request-contract cross-contract interface (minimal) ────────────────────────
 
 mod request_client {
-    use soroban_sdk::{contractclient, contracttype, Env};
+    use soroban_sdk::{contractclient, contracttype, Address, Env, Vec};
 
     #[contracttype]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum RequestStatus {
         Pending,
         Approved,
+        InProgress,
         Fulfilled,
         Cancelled,
+        Rejected,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BloodType {
+        APositive,
+        ANegative,
+        BPositive,
+        BNegative,
+        ABPositive,
+        ABNegative,
+        OPositive,
+        ONegative,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BloodComponent {
+        WholeBlood,
+        RedCells,
+        Plasma,
+        Platelets,
+        Cryoprecipitate,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Urgency {
+        Critical,
+        Urgent,
+        Routine,
+        Scheduled,
     }
 
     #[contracttype]
     #[derive(Clone, Debug)]
     pub struct BloodRequest {
         pub id: u64,
+        pub hospital_id: Address,
+        pub blood_type: BloodType,
+        pub component: BloodComponent,
+        pub quantity_ml: u32,
+        pub urgency: Urgency,
+        pub created_timestamp: u64,
+        pub required_by_timestamp: u64,
         pub status: RequestStatus,
+        pub assigned_units: Vec<u64>,
+        pub fulfilled_quantity_ml: u32,
+        pub reservation_id: Option<u64>,
+        pub history: Vec<RequestHistoryEntry>,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct RequestHistoryEntry {
+        pub previous_status: RequestStatus,
+        pub is_initial_transition: bool,
+        pub new_status: RequestStatus,
+        pub actor: Address,
+        pub reason: soroban_sdk::String,
+        pub fulfilled_delta_ml: u32,
+        pub released_reservation: bool,
+        pub timestamp: u64,
     }
 
     #[contractclient(name = "RequestContractClient")]
+    #[allow(dead_code)]
     pub trait RequestContractInterface {
         fn get_request(env: Env, request_id: u64) -> BloodRequest;
         fn update_request_status(
@@ -403,6 +596,88 @@ fn try_cancel_request(env: &Env, requests_contract: &Address, request_id: u64) {
     );
 }
 
+// ── Contract events ───────────────────────────────────────────────────────────
+
+#[contractevent(topics = ["payment", "created"], data_format = "single-value")]
+pub struct PaymentCreated {
+    pub payment_id: u64,
+}
+
+#[contractevent(topics = ["payment", "escrowed"], data_format = "single-value")]
+pub struct PaymentEscrowed {
+    pub payment_id: u64,
+}
+
+#[contractevent(topics = ["payment", "coord_ok"], data_format = "single-value")]
+pub struct PaymentCoordConfirmed {
+    pub payment_id: u64,
+}
+
+#[contractevent(topics = ["payment", "released"], data_format = "vec")]
+pub struct PaymentReleased {
+    pub payment_id: u64,
+    pub payee: Address,
+    pub amount: i128,
+}
+
+#[contractevent(topics = ["payment", "hosp_ok"], data_format = "single-value")]
+pub struct PaymentHospConfirmed {
+    pub payment_id: u64,
+}
+
+#[contractevent(topics = ["payment", "status"], data_format = "vec")]
+pub struct PaymentStatusChanged {
+    pub payment_id: u64,
+    pub old_status: PaymentStatus,
+    pub new_status: PaymentStatus,
+}
+
+#[contractevent(topics = ["payment", "disputed"], data_format = "vec")]
+pub struct PaymentDisputed {
+    pub payment_id: u64,
+    pub reason_code: u32,
+    pub case_id: String,
+}
+
+#[contractevent(topics = ["payment", "resolved"], data_format = "single-value")]
+pub struct PaymentResolved {
+    pub payment_id: u64,
+}
+
+#[contractevent(topics = ["payment", "refunded"], data_format = "vec")]
+pub struct PaymentRefunded {
+    pub payment_id: u64,
+    pub payer: Address,
+    pub amount: i128,
+}
+
+#[contractevent(topics = ["pledge", "create"], data_format = "single-value")]
+pub struct PledgeCreated {
+    pub pledge_id: u64,
+}
+
+#[contractevent(topics = ["vest", "created"], data_format = "vec")]
+pub struct VestingCreated {
+    pub donor: Address,
+    pub total_amount: i128,
+    pub cliff_timestamp: u64,
+    pub vest_end_timestamp: u64,
+}
+
+#[contractevent(topics = ["vest", "claimed"], data_format = "vec")]
+pub struct VestingClaimed {
+    pub donor: Address,
+    pub claimable: i128,
+    pub new_claimed: i128,
+}
+
+#[contractevent(topics = ["request", "cancelled"], data_format = "vec")]
+pub struct RequestCancelledByPayment {
+    pub request_id: u64,
+    pub payment_id: u64,
+    pub timestamp: u64,
+}
+
 // ── Contract ───────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -425,34 +700,51 @@ impl PaymentContract {
         if let Some(rc) = requests_contract {
             env.storage().instance().set(&REQ_CONTRACT, &rc);
         }
+        extend_instance_ttl(&env);
         Ok(())
+    }
+
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
     }
 
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored: Address = env.storage().instance().get(&ADMIN_KEY).ok_or(Error::Unauthorized)?;
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
         if admin != stored {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&PAUSED_KEY, &true);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
     pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored: Address = env.storage().instance().get(&ADMIN_KEY).ok_or(Error::Unauthorized)?;
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
         if admin != stored {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&PAUSED_KEY, &false);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
     pub fn is_paused(env: Env) -> bool {
+        extend_instance_ttl(&env);
         env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
+        extend_instance_ttl(env);
         if env.storage().instance().get(&PAUSED_KEY).unwrap_or(false) {
             return Err(Error::ContractPaused);
         }
@@ -460,6 +752,7 @@ impl PaymentContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        extend_instance_ttl(env);
         let stored: Address = env
             .storage()
             .instance()
@@ -469,6 +762,15 @@ impl PaymentContract {
             return Err(Error::Unauthorized);
         }
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn is_admin(env: &Env, caller: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, Address>(&ADMIN_KEY)
+            .map(|a| a == *caller)
+            .unwrap_or(false)
     }
 
     pub fn create_payment(
@@ -488,19 +790,16 @@ impl PaymentContract {
         payer.require_auth();
 
         // Reject if a payment for this request already exists.
-        let existing_map: Map<u64, u64> = env
-            .storage()
-            .instance()
-            .get(&REQ_IDX)
-            .unwrap_or(Map::new(&env));
-        if existing_map.contains_key(request_id) {
+        if env.storage().persistent().has(&req_idx_key(request_id)) {
             return Err(Error::DuplicatePayment);
         }
 
-        // Validate request state if the requests contract is configured.
-        if let Some(rc) = env.storage().instance().get::<_, Address>(&REQ_CONTRACT) {
-            validate_request_payable(&env, &rc, request_id)?;
-        }
+        let rc = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&REQ_CONTRACT)
+            .ok_or(Error::RequestNotFound)?;
+        validate_request_payable(&env, &rc, request_id)?;
 
         let id = get_counter(&env) + 1;
         set_counter(&env, id);
@@ -526,8 +825,10 @@ impl PaymentContract {
         index_by_payee(&env, &payee, id);
         index_by_status(&env, PaymentStatus::Pending, id);
         index_by_request(&env, request_id, id);
+        timeline_append(&env, request_id, id);
 
-        env.events().publish((symbol_short!("payment"), symbol_short!("created")), id);
+        PaymentCreated { payment_id: id }.publish(&env);
+
         Ok(id)
     }
 
@@ -566,12 +867,7 @@ impl PaymentContract {
         hospital.require_auth();
 
         // Reject if a payment for this request already exists.
-        let existing_map: Map<u64, u64> = env
-            .storage()
-            .instance()
-            .get(&REQ_IDX)
-            .unwrap_or(Map::new(&env));
-        if existing_map.contains_key(request_id) {
+        if env.storage().persistent().has(&req_idx_key(request_id)) {
             return Err(Error::DuplicatePayment);
         }
 
@@ -581,11 +877,9 @@ impl PaymentContract {
         }
 
         let token_client = token::Client::new(&env, &token);
-        let available = token_client.balance(&hospital);
-        if available < amount {
-            return Err(Error::InsufficientEscrowFunds);
-        }
-        token_client.transfer(&hospital, &env.current_contract_address(), &amount);
+        // Transfer before persisting the escrow payment. If the transfer fails,
+        // the transaction aborts and no payment record is written.
+        token_client.transfer(&hospital, env.current_contract_address(), &amount);
 
         let id = get_counter(&env) + 1;
         set_counter(&env, id);
@@ -611,20 +905,23 @@ impl PaymentContract {
         index_by_payee(&env, &payee, id);
         index_by_status(&env, PaymentStatus::Locked, id);
         index_by_request(&env, request_id, id);
-        update_stats_on_transition(&env, amount, PaymentStatus::Pending, PaymentStatus::Locked);
+        timeline_append(&env, request_id, id);
+        update_stats_on_transition(&env, amount, PaymentStatus::Pending, PaymentStatus::Locked)?;
 
-        env.events().publish((symbol_short!("payment"), symbol_short!("escrowed")), id);
+        PaymentEscrowed { payment_id: id }.publish(&env);
+
         Ok(id)
     }
 
-    /// Release escrowed funds to the payee. Admin only.
+    /// Release escrowed funds to the payee. Requires two-party confirmation.
     /// Transfers the locked amount from the contract to the payee and marks
     /// the payment as Released.
-    pub fn release_escrow(
-        env: Env,
-        caller: Address,
-        payment_id: u64,
-    ) -> Result<(), Error> {
+    ///
+    /// Issue #848 fix: Two-step confirmation process
+    /// - Coordinator (admin) confirms delivery via release_escrow
+    /// - Hospital (payer) confirms receipt via confirm_receipt
+    /// - Payment only releases when both parties have confirmed
+    pub fn release_escrow(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
@@ -635,6 +932,24 @@ impl PaymentContract {
             return Err(Error::PaymentNotLocked);
         }
 
+        // Mark coordinator confirmation
+        let coord_key = (payment_id, "coord_ok");
+        env.storage().persistent().set(&coord_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&coord_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+
+        // Check if hospital has also confirmed
+        let hosp_key = (payment_id, "hosp_ok");
+        let hospital_confirmed: bool = env.storage().persistent().get(&hosp_key).unwrap_or(false);
+
+        if !hospital_confirmed {
+            // Coordinator confirmed but waiting for hospital
+            PaymentCoordConfirmed { payment_id }.publish(&env);
+            return Ok(());
+        }
+
+        // Both parties confirmed - release payment
         let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
         let token_client = token::Client::new(&env, &token_addr);
         token_client.transfer(
@@ -650,23 +965,92 @@ impl PaymentContract {
 
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, PaymentStatus::Released, payment_id);
-        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Released);
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Released)?;
+        remove_from_request_index(&env, payment.request_id);
 
-        env.events().publish(
-            (symbol_short!("payment"), symbol_short!("released")),
-            (payment_id, payment.payee.clone(), payment.amount),
+        // Clean up confirmation flags
+        env.storage().persistent().remove(&coord_key);
+        env.storage().persistent().remove(&hosp_key);
+
+        PaymentReleased {
+            payment_id,
+            payee: payment.payee.clone(),
+            amount: payment.amount,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Hospital confirms receipt of blood units (issue #848 fix).
+    /// Payment is only released when both coordinator and hospital confirm.
+    pub fn confirm_receipt(env: Env, payment_id: u64, hospital: Address) -> Result<(), Error> {
+        hospital.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+
+        if payment.status != PaymentStatus::Locked {
+            return Err(Error::PaymentNotLocked);
+        }
+
+        if payment.payer != hospital {
+            return Err(Error::Unauthorized);
+        }
+
+        // Mark hospital confirmation
+        let hosp_key = (payment_id, "hosp_ok");
+        env.storage().persistent().set(&hosp_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&hosp_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+
+        // Check if coordinator has also confirmed
+        let coord_key = (payment_id, "coord_ok");
+        let coordinator_confirmed: bool =
+            env.storage().persistent().get(&coord_key).unwrap_or(false);
+
+        if !coordinator_confirmed {
+            // Hospital confirmed but waiting for coordinator
+            PaymentHospConfirmed { payment_id }.publish(&env);
+            return Ok(());
+        }
+
+        // Both parties confirmed - release payment
+        let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &payment.payee,
+            &payment.amount,
         );
+
+        let old_status = payment.status;
+        payment.status = PaymentStatus::Released;
+        payment.updated_at = env.ledger().timestamp();
+        store_payment(&env, &payment);
+
+        remove_from_status_index(&env, old_status, payment_id);
+        index_by_status(&env, PaymentStatus::Released, payment_id);
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Released)?;
+        remove_from_request_index(&env, payment.request_id);
+
+        // Clean up confirmation flags
+        env.storage().persistent().remove(&coord_key);
+        env.storage().persistent().remove(&hosp_key);
+
+        PaymentReleased {
+            payment_id,
+            payee: payment.payee.clone(),
+            amount: payment.amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
     /// Refund escrowed funds to the payer. Admin only.
     /// Transfers the locked amount from the contract back to the payer and
     /// marks the payment as Refunded.
-    pub fn refund_escrow(
-        env: Env,
-        caller: Address,
-        payment_id: u64,
-    ) -> Result<(), Error> {
+    pub fn refund_escrow(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
@@ -692,25 +1076,73 @@ impl PaymentContract {
 
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, PaymentStatus::Refunded, payment_id);
-        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded);
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded)?;
+        remove_from_request_index(&env, payment.request_id);
 
-        env.events().publish(
-            (symbol_short!("payment"), symbol_short!("refunded")),
-            (payment_id, payment.payer.clone(), payment.amount),
-        );
+        PaymentRefunded {
+            payment_id,
+            payer: payment.payer.clone(),
+            amount: payment.amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) -> Result<(), Error> {
+    pub fn update_status(
+        env: Env,
+        payment_id: u64,
+        status: PaymentStatus,
+        caller: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+
+        // Security fix: prevent escrow bypass via update_status
+        // Released/Refunded require actual token transfer, which must go through
+        // release_escrow/refund_escrow. update_status cannot move funds.
+        if matches!(status, PaymentStatus::Released | PaymentStatus::Refunded) {
+            if payment.token.is_some() {
+                return Err(Error::EscrowSettlementRequired);
+            }
+        }
+
         let old_status = payment.status;
+
+        // Security fix: a terminal payment (Released/Refunded/Cancelled) must
+        // never move back to a non-terminal status. remove_from_request_index
+        // is only called when *entering* a terminal status, so resurrecting a
+        // terminal payment would leave req_idx_key deleted while this payment
+        // is live again, letting a fresh create_payment for the same request
+        // slip past the DuplicatePayment guard.
+        if is_terminal_status(old_status) && !is_terminal_status(status) {
+            return Err(Error::InvalidStatusTransition);
+        }
+
         payment.status = status;
         payment.updated_at = env.ledger().timestamp();
         store_payment(&env, &payment);
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, status, payment_id);
-        update_stats_on_transition(&env, payment.amount, old_status, status);
+        update_stats_on_transition(&env, payment.amount, old_status, status)?;
+        if matches!(
+            status,
+            PaymentStatus::Released | PaymentStatus::Refunded | PaymentStatus::Cancelled
+        ) {
+            remove_from_request_index(&env, payment.request_id);
+        }
+
+        // Emit event on every status transition so off-chain indexers can stay
+        // in sync without polling. Topics: ("payment", "status") so indexers can
+        // filter by contract + topic pair.
+        PaymentStatusChanged {
+            payment_id,
+            old_status,
+            new_status: status,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -719,9 +1151,21 @@ impl PaymentContract {
         payment_id: u64,
         reason: DisputeReason,
         case_id: String,
+        caller: Address,
     ) -> Result<(), Error> {
+        caller.require_auth();
         Self::require_not_paused(&env)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+        if caller != payment.payer && caller != payment.payee {
+            return Err(Error::Unauthorized);
+        }
+        // Only Pending or Locked payments may be disputed.  Raising a dispute
+        // on an already-Released or Refunded payment has no token backing and
+        // would silently corrupt aggregate statistics.
+        match payment.status {
+            PaymentStatus::Pending | PaymentStatus::Locked => {}
+            _ => return Err(Error::InvalidStatus),
+        }
         let old_status = payment.status;
         payment.status = PaymentStatus::Disputed;
         payment.dispute_reason_code = Some(dispute_reason_to_code(reason));
@@ -731,26 +1175,97 @@ impl PaymentContract {
         store_payment(&env, &payment);
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, PaymentStatus::Disputed, payment_id);
-        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Disputed);
-        env.events().publish(
-            (symbol_short!("payment"), symbol_short!("disputed")),
-            (payment_id, dispute_reason_to_code(reason)),
-        );
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Disputed)?;
+        PaymentDisputed {
+            payment_id,
+            reason_code: dispute_reason_to_code(reason),
+            case_id,
+        }
+        .publish(&env);
         Ok(())
     }
 
-    pub fn resolve_dispute(env: Env, payment_id: u64) -> Result<(), Error> {
+    /// Resolve a disputed payment: either release funds to the payee or refund
+    /// them to the payer, depending on `resolution`. For escrow-backed payments
+    /// the actual token transfer is executed atomically within this call.
+    /// For bookkeeping-only (non-escrow) payments the status is updated without
+    /// any token transfer — off-chain settlement is assumed.
+    pub fn resolve_dispute(
+        env: Env,
+        payment_id: u64,
+        resolution: DisputeResolution,
+        caller: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
+
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
-        if payment.dispute_case_id.is_some() {
-            payment.dispute_resolved = true;
+
+        if payment.status != PaymentStatus::Disputed {
+            return Err(Error::PaymentNotDisputed);
         }
+
+        // ── Escrow: execute the token transfer ────────────────────────────
+        if let Some(ref token_addr) = payment.token {
+            let token_client = token::Client::new(&env, token_addr);
+            match resolution {
+                DisputeResolution::ReleaseToPayee => {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &payment.payee,
+                        &payment.amount,
+                    );
+                }
+                DisputeResolution::RefundToPayer => {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &payment.payer,
+                        &payment.amount,
+                    );
+                }
+            }
+        }
+
+        // ── Update payment state ──────────────────────────────────────────
+        let old_status = payment.status;
+        let new_status = match resolution {
+            DisputeResolution::ReleaseToPayee => PaymentStatus::Released,
+            DisputeResolution::RefundToPayer => PaymentStatus::Refunded,
+        };
+
+        payment.status = new_status;
+        payment.dispute_resolved = true;
         payment.updated_at = env.ledger().timestamp();
         store_payment(&env, &payment);
-        env.events().publish(
-            (symbol_short!("payment"), symbol_short!("resolved")),
-            payment_id,
-        );
+
+        remove_from_status_index(&env, old_status, payment_id);
+        index_by_status(&env, new_status, payment_id);
+        update_stats_on_transition(&env, payment.amount, old_status, new_status)?;
+        remove_from_request_index(&env, payment.request_id);
+
+        // ── Emit events ───────────────────────────────────────────────────
+        PaymentResolved { payment_id }.publish(&env);
+
+        match resolution {
+            DisputeResolution::ReleaseToPayee => {
+                PaymentReleased {
+                    payment_id,
+                    payee: payment.payee.clone(),
+                    amount: payment.amount,
+                }
+                .publish(&env);
+            }
+            DisputeResolution::RefundToPayer => {
+                PaymentRefunded {
+                    payment_id,
+                    payer: payment.payer.clone(),
+                    amount: payment.amount,
+                }
+                .publish(&env);
+            }
+        }
+
         Ok(())
     }
 
@@ -761,12 +1276,11 @@ impl PaymentContract {
     }
 
     pub fn get_payment_by_request(env: Env, request_id: u64) -> Result<Payment, Error> {
-        let map: Map<u64, u64> = env
+        let payment_id: u64 = env
             .storage()
-            .instance()
-            .get(&REQ_IDX)
-            .unwrap_or(Map::new(&env));
-        let payment_id = map.get(request_id).ok_or(Error::PaymentNotFound)?;
+            .persistent()
+            .get(&req_idx_key(request_id))
+            .ok_or(Error::PaymentNotFound)?;
         load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)
     }
 
@@ -819,25 +1333,43 @@ impl PaymentContract {
         load_stats(&env)
     }
 
-    pub fn get_payment_timeline(env: Env, page: u32, page_size: u32) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
-        let total = get_counter(&env);
-        let start = (page as u64) * (page_size as u64) + 1;
-        let end = (start + page_size as u64 - 1).min(total);
-
+    /// Returns the ordered payment history for a specific request.
+    ///
+    /// Uses the per-request timeline index written at payment creation — no
+    /// full scan and no sort on the read path.  `offset` is a zero-based item
+    /// index; `limit` caps the number of items returned (clamped to 100).
+    pub fn get_payment_timeline(
+        env: Env,
+        request_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Payment> {
+        let limit = limit.clamp(1, 100);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&request_timeline_key(request_id))
+            .unwrap_or(Vec::new(&env));
+        let total = ids.len();
+        let start = offset;
+        let end = (start + limit).min(total);
         let mut items: Vec<Payment> = Vec::new(&env);
-        for id in start..=end {
-            if let Some(p) = load_payment(&env, id) {
-                items.push_back(p);
+        if start < total {
+            for i in start..end {
+                let id = ids.get(i).unwrap();
+                if let Some(p) = load_payment(&env, id) {
+                    items.push_back(p);
+                }
             }
         }
-        PaymentPage { items, total, page, page_size }
+        items
     }
 
     pub fn get_payment_count(env: Env) -> u64 {
         get_counter(&env)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_pledge(
         env: Env,
         donor: Address,
@@ -873,7 +1405,9 @@ impl PaymentContract {
             created_at: env.ledger().timestamp(),
         };
         store_pledge(&env, &pledge);
-        env.events().publish((symbol_short!("pledge"), symbol_short!("create")), id);
+
+        PledgeCreated { pledge_id: id }.publish(&env);
+
         Ok(id)
     }
 
@@ -927,6 +1461,17 @@ impl PaymentContract {
         if duration_secs == 0 {
             return Err(Error::InvalidAmount);
         }
+        if duration_secs <= cliff_secs {
+            return Err(Error::InvalidVestingSchedule);
+        }
+
+        // Reject if donor already has an active (uncompleted) vesting schedule.
+        // Overwriting it would silently destroy unclaimed rewards.
+        if let Some(existing) = load_vesting(&env, &donor) {
+            if existing.claimed < existing.total_amount {
+                return Err(Error::ActiveVestingExists);
+            }
+        }
 
         if load_vesting(&env, &donor).is_some() {
             return Err(Error::ActiveVestingExists);
@@ -967,7 +1512,7 @@ impl PaymentContract {
         Ok(())
     }
 
-    pub fn claim_vested(env: Env, donor: Address, reward_token: Address) -> Result<i128, Error> {
+    pub fn claim_vested(env: Env, donor: Address) -> Result<i128, Error> {
         donor.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -1020,13 +1565,15 @@ impl PaymentContract {
             store_vesting(&env, &schedule);
         }
 
-        let token_client = token::Client::new(&env, &reward_token);
+        let token_client = token::Client::new(&env, &schedule.reward_token);
         token_client.transfer(&env.current_contract_address(), &donor, &claimable);
 
-        env.events().publish(
-            (symbol_short!("vest"), symbol_short!("claimed")),
-            (donor, claimable, new_claimed),
-        );
+        VestingClaimed {
+            donor,
+            claimable,
+            new_claimed,
+        }
+        .publish(&env);
 
         Ok(claimable)
     }
@@ -1041,7 +1588,13 @@ impl PaymentContract {
     pub fn set_dispute_timeout(env: Env, admin: Address, timeout_secs: u64) -> Result<(), Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DISPUTE_TIMEOUT, &timeout_secs);
+        if timeout_secs > MAX_DISPUTE_TIMEOUT_SECS {
+            return Err(Error::InvalidTimeout);
+        }
+        env.storage()
+            .instance()
+            .set(&DISPUTE_TIMEOUT, &timeout_secs);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -1074,9 +1627,19 @@ impl PaymentContract {
                 Some(p) => p,
                 None => continue,
             };
-            if payment.status != PaymentStatus::Disputed { continue; }
-            if payment.token.is_none() { continue; }
-            if now < payment.updated_at + timeout { continue; }
+            if payment.status != PaymentStatus::Disputed {
+                continue;
+            }
+            if payment.token.is_none() {
+                continue;
+            }
+            let expires_at = payment
+                .updated_at
+                .checked_add(timeout)
+                .ok_or(Error::Overflow)?;
+            if now < expires_at {
+                continue;
+            }
 
             let token_client = token::Client::new(&env, payment.token.as_ref().unwrap());
             token_client.transfer(
@@ -1091,21 +1654,25 @@ impl PaymentContract {
             store_payment(&env, &payment);
             remove_from_status_index(&env, old_status, pid);
             index_by_status(&env, PaymentStatus::Refunded, pid);
-            update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded);
+            update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded)?;
+            remove_from_request_index(&env, payment.request_id);
 
             if let Some(ref rc) = req_contract {
                 try_cancel_request(&env, rc, payment.request_id);
             }
 
-            env.events().publish(
-                (symbol_short!("payment"), symbol_short!("refunded")),
-                (pid, payment.payer.clone(), payment.amount),
-            );
-            // Request-level event for off-chain projections.
-            env.events().publish(
-                (symbol_short!("request"), symbol_short!("cancelled")),
-                (payment.request_id, pid, now),
-            );
+            PaymentRefunded {
+                payment_id: pid,
+                payer: payment.payer.clone(),
+                amount: payment.amount,
+            }
+            .publish(&env);
+            RequestCancelledByPayment {
+                request_id: payment.request_id,
+                payment_id: pid,
+                timestamp: now,
+            }
+            .publish(&env);
 
             refunded.push_back(pid);
         }
@@ -1130,8 +1697,42 @@ impl PaymentContract {
             }
         }
 
-        PaymentPage { items, total, page, page_size }
+        PaymentPage {
+            items,
+            total,
+            page,
+            page_size,
+        }
+    }
+
+    /// Upgrade the contract to a new WASM hash. Only admin can call this.
+    ///
+    /// # Arguments
+    /// * `admin` - Admin address that must authorize the upgrade
+    /// * `new_wasm_hash` - Hash of the new WASM code to upgrade to
+    ///
+    /// # Errors
+    /// * `Unauthorized` - If caller is not the admin
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        extend_instance_ttl(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 }
 
 mod test;
+mod test_two_party_confirmation;
+mod test_security_fixes;

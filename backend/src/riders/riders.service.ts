@@ -25,16 +25,28 @@ import { WorkingHoursDto } from './dto/working-hours.dto';
 import { RiderEntity } from './entities/rider.entity';
 import { RiderStatus } from './enums/rider-status.enum';
 
-const ALLOWED_STATUS_TRANSITIONS: Record<RiderStatus, RiderStatus[]> = {
-  [RiderStatus.OFFLINE]: [RiderStatus.AVAILABLE],
-  [RiderStatus.AVAILABLE]: [
-    RiderStatus.OFFLINE,
-    RiderStatus.BUSY,
-    RiderStatus.ON_DELIVERY,
-  ],
-  [RiderStatus.BUSY]: [RiderStatus.AVAILABLE, RiderStatus.OFFLINE],
-  [RiderStatus.ON_DELIVERY]: [RiderStatus.AVAILABLE, RiderStatus.OFFLINE],
+/** Public record shape returned by getAvailableRiders — maps to RiderEntity */
+export type RiderRecord = RiderEntity & {
+  averageRating: number;
+  activeDeliveries: number;
 };
+
+function haversineKm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 @Injectable()
 export class RidersService {
@@ -225,31 +237,31 @@ export class RidersService {
     };
   }
 
-  async getAvailableRiders() {
+  async getAvailableRiders(): Promise<{ message: string; data: RiderRecord[] }> {
     const riders = await this.riderRepository.find({
       where: { status: RiderStatus.AVAILABLE, isVerified: true },
     });
+    const data: RiderRecord[] = riders.map((r) => ({
+      ...r,
+      averageRating: r.rating,
+      activeDeliveries: r.completedDeliveries,
+    }));
     return {
       message: 'Available riders retrieved successfully',
-      data: riders,
+      data,
     };
   }
 
   async queryAvailability(dto: AvailabilityQueryDto) {
-    const riders = await this.riderRepository.find({
-      where: { status: RiderStatus.AVAILABLE, isVerified: true },
-    });
-
-    let results = riders;
+    const qb = this.riderRepository
+      .createQueryBuilder('rider')
+      .where('rider.status = :status', { status: RiderStatus.AVAILABLE })
+      .andWhere('rider.is_verified = true');
 
     if (dto.area) {
-      results = results.filter(
-        (r) =>
-          Array.isArray(r.preferredAreas) &&
-          r.preferredAreas.some((a) =>
-            a.toLowerCase().includes(dto.area!.toLowerCase()),
-          ),
-      );
+      qb.andWhere('rider.preferred_areas::text ILIKE :area', {
+        area: `%${dto.area}%`,
+      });
     }
 
     if (
@@ -257,17 +269,20 @@ export class RidersService {
       dto.longitude !== undefined &&
       dto.radiusKm !== undefined
     ) {
-      results = results.filter((rider) => {
-        if (rider.latitude === null || rider.longitude === null) return false;
-        const latKm = Math.abs(rider.latitude - dto.latitude!) * 111;
-        const lngKm =
-          Math.abs(rider.longitude - dto.longitude!) *
-          111 *
-          Math.cos((dto.latitude! * Math.PI) / 180);
-        return Math.sqrt(latKm ** 2 + lngKm ** 2) <= dto.radiusKm!;
-      });
+      qb
+        .andWhere('rider.latitude IS NOT NULL')
+        .andWhere('rider.longitude IS NOT NULL')
+        .andWhere(
+          `(6371 * acos(LEAST(1.0,
+            cos(radians(:lat)) * cos(radians(CAST(rider.latitude AS float))) *
+            cos(radians(CAST(rider.longitude AS float)) - radians(:lng)) +
+            sin(radians(:lat)) * sin(radians(CAST(rider.latitude AS float)))
+          ))) <= :radius`,
+          { lat: dto.latitude, lng: dto.longitude, radius: dto.radiusKm },
+        );
     }
 
+    const results = await qb.getMany();
     return {
       message: 'Availability query successful',
       data: results,
@@ -284,12 +299,7 @@ export class RidersService {
       if (rider.latitude === null || rider.longitude === null) {
         return false;
       }
-      const latKm = Math.abs(rider.latitude - latitude) * 111;
-      const lngKm =
-        Math.abs(rider.longitude - longitude) *
-        111 *
-        Math.cos((latitude * Math.PI) / 180);
-      return Math.sqrt(latKm ** 2 + lngKm ** 2) <= radiusKm;
+      return haversineKm(latitude, longitude, rider.latitude, rider.longitude) <= radiusKm;
     });
 
     return {
@@ -356,33 +366,26 @@ export class RidersService {
   }> {
     const riders = await this.riderRepository.find({
       where: { isVerified: true },
+      order: { completedDeliveries: 'DESC', rating: 'DESC' },
+      take: limit,
     });
 
-    const ranked = riders
-      .map((r) => {
+    return {
+      message: 'Leaderboard retrieved successfully',
+      data: riders.map((r, i) => {
         const total =
           r.completedDeliveries + r.cancelledDeliveries + r.failedDeliveries;
         const successRate =
-          total === 0
-            ? 0
-            : Math.round((r.completedDeliveries / total) * 10000) / 100;
+          total === 0 ? 0 : Math.round((r.completedDeliveries / total) * 10000) / 100;
         return {
+          rank: i + 1,
           riderId: r.id,
           completedDeliveries: r.completedDeliveries,
           successRate,
           rating: r.rating,
         };
-      })
-      .sort(
-        (a, b) =>
-          b.completedDeliveries - a.completedDeliveries ||
-          b.successRate - a.successRate ||
-          b.rating - a.rating,
-      )
-      .slice(0, limit)
-      .map((r, i) => ({ rank: i + 1, ...r }));
-
-    return { message: 'Leaderboard retrieved successfully', data: ranked };
+      }),
+    };
   }
 
   private emitStatusChangeEvent(rider: RiderEntity, previousStatus: RiderStatus) {

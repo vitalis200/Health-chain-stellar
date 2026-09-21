@@ -1,21 +1,35 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 
-import { SorobanService } from '../../soroban/soroban.service';
-import { CustodyHandoffEntity } from '../entities/custody-handoff.entity';
-import { CustodyHandoffStatus } from '../enums/custody.enum';
-import { ConfirmHandoffDto, RecordHandoffDto } from '../dto/custody.dto';
+import { SorobanService } from '../soroban/soroban.service';
+import { CustodyHandoffEntity } from './entities/custody-handoff.entity';
+import { CustodyHandoffStatus } from './enums/custody.enum';
+import { ConfirmHandoffDto, RecordHandoffDto } from './dto/custody.dto';
 
 @Injectable()
 export class CustodyService {
+  private readonly logger = new Logger(CustodyService.name);
+
   constructor(
     @InjectRepository(CustodyHandoffEntity)
     private readonly handoffRepo: Repository<CustodyHandoffEntity>,
     private readonly sorobanService: SorobanService,
   ) {}
 
-  async recordHandoff(dto: RecordHandoffDto): Promise<CustodyHandoffEntity> {
+  async recordHandoff(dto: RecordHandoffDto, performedByUserId: string): Promise<CustodyHandoffEntity> {
+    // Chain-continuity check: fromActorId must match the toActorId of the last confirmed handoff for this unit
+    const lastConfirmed = await this.handoffRepo.findOne({
+      where: { bloodUnitId: dto.bloodUnitId, status: CustodyHandoffStatus.CONFIRMED },
+      order: { createdAt: 'DESC' },
+    });
+
+    if (lastConfirmed && lastConfirmed.toActorId !== dto.fromActorId) {
+      throw new BadRequestException(
+        `Chain-of-custody break: fromActorId must be the current custodian (${lastConfirmed.toActorId})`,
+      );
+    }
+
     // Initiate on-chain custody transfer
     let contractEventId: string | null = null;
     try {
@@ -26,8 +40,10 @@ export class CustodyService {
         condition: `${dto.fromActorType}→${dto.toActorType}`,
       });
       contractEventId = result.transactionHash;
-    } catch {
-      // Non-fatal: persist off-chain even if on-chain call fails
+    } catch (err: unknown) {
+      this.logger.warn(
+        `On-chain custody transfer failed for unit ${dto.bloodUnitId}: ${(err as Error).message}. Persisting off-chain record only.`,
+      );
     }
 
     const handoff = this.handoffRepo.create({
@@ -41,21 +57,30 @@ export class CustodyService {
       longitude: dto.longitude ?? null,
       proofReference: dto.proofReference ?? null,
       contractEventId,
+      performedByUserId,
       status: CustodyHandoffStatus.PENDING,
     });
 
     return this.handoffRepo.save(handoff);
   }
 
-  async confirmHandoff(id: string, dto: ConfirmHandoffDto): Promise<CustodyHandoffEntity> {
+  async confirmHandoff(id: string, dto: ConfirmHandoffDto, callerUserId: string): Promise<CustodyHandoffEntity> {
     const handoff = await this.handoffRepo.findOne({ where: { id } });
     if (!handoff) throw new NotFoundException('Custody handoff not found');
     if (handoff.status !== CustodyHandoffStatus.PENDING) {
       throw new BadRequestException('Handoff is not in pending state');
     }
 
+    // Only the intended recipient (toActorId) may confirm receipt
+    if (callerUserId !== handoff.toActorId) {
+      throw new ForbiddenException(
+        'Only the intended recipient of this handoff may confirm it',
+      );
+    }
+
     handoff.status = CustodyHandoffStatus.CONFIRMED;
     handoff.confirmedAt = new Date();
+    handoff.performedByUserId = callerUserId;
     if (dto.proofReference) handoff.proofReference = dto.proofReference;
 
     return this.handoffRepo.save(handoff);

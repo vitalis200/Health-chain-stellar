@@ -30,6 +30,7 @@ pub enum ContractError {
     InsufficientBalance = 130,
     InsufficientPermissions = 131,
     NotAuthorizedBloodBank = 132,
+    NotUnitOwner = 133,
 
     // Blood-specific errors (140-149)
     BloodUnitNotAvailable = 140,
@@ -42,4 +43,12 @@ pub enum ContractError {
 
     // Circuit breaker (160)
     ContractPaused = 160,
+
+    // Role-based access control (170-179)
+    InvalidRole = 170,
+    InsufficientRolePermission = 171,
+
+    // Cross-contract synchronisation (180-189)
+    RegistryNotConfigured = 180,
+    RegistryCallFailed = 181,
 }

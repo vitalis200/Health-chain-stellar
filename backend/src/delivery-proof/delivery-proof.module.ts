@@ -1,13 +1,15 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
-import { DeliveryProofEntity } from './entities/delivery-proof.entity';
-import { DeliveryProofService } from './delivery-proof.service';
-import { DeliveryProofController } from './delivery-proof.controller';
-
-import { ConfigModule } from '@nestjs/config';
-import { SorobanModule } from '../soroban/soroban.module';
 import { CustodyModule } from '../custody/custody.module';
+import { FileMetadataModule } from '../file-metadata/file-metadata.module';
+import { SorobanModule } from '../soroban/soroban.module';
+
+import { DeliveryProofController } from './delivery-proof.controller';
+import { DeliveryProofService } from './delivery-proof.service';
+import { DeliveryProofEntity } from './entities/delivery-proof.entity';
+import { UploadValidationService } from './upload-validation.service';
 
 @Module({
   imports: [
@@ -15,10 +17,10 @@ import { CustodyModule } from '../custody/custody.module';
     ConfigModule,
     SorobanModule,
     CustodyModule,
+    FileMetadataModule,
   ],
   controllers: [DeliveryProofController],
-  providers: [DeliveryProofService],
+  providers: [DeliveryProofService, UploadValidationService],
   exports: [DeliveryProofService],
 })
 export class DeliveryProofModule {}
-

@@ -1,6 +1,15 @@
-use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
-use crate::{DataKey, Error, Organization};
+use crate::{DataKey, Error, IdentityContract, OrgUnverified, OrgVerified, Organization, Role};
+
+/// Persistent storage TTL constants (ledgers; one ledger ≈ 5 s on mainnet).
+/// Mirrors the constants used elsewhere in the crate (see lib.rs).
+const TTL_THRESHOLD: u32 = 518_400; // ~30 days
+const TTL_EXTEND_TO: u32 = 1_036_800; // ~60 days
+
+/// Maximum number of organizations allowed in a single batch verify/revoke
+/// call, bounding the per-transaction CPU/memory cost of the operation.
+const MAX_BATCH_SIZE: u32 = 50;
 
 /// Verification metadata for tracking on-chain verification state
 #[contracttype]
@@ -25,10 +34,15 @@ pub struct VerificationEvent {
     pub reason: Option<String>,
 }
 
+#[allow(dead_code)]
 pub trait VerificationTrait {
     /// Verify an organization (admin only)
     /// Returns the verification metadata
-    fn verify_organization(env: Env, admin: Address, org_id: Address) -> Result<VerificationMetadata, Error>;
+    fn verify_organization(
+        env: Env,
+        admin: Address,
+        org_id: Address,
+    ) -> Result<VerificationMetadata, Error>;
 
     /// Unverify/revoke an organization (admin only)
     /// Returns the verification metadata
@@ -49,10 +63,18 @@ pub trait VerificationTrait {
     fn get_verification_timestamp(env: Env, org_id: Address) -> Result<Option<u64>, Error>;
 
     /// Get verification event history (last N events)
-    fn get_verification_events(env: Env, org_id: Address, limit: u32) -> Result<Vec<VerificationEvent>, Error>;
+    fn get_verification_events(
+        env: Env,
+        org_id: Address,
+        limit: u32,
+    ) -> Result<Vec<VerificationEvent>, Error>;
 
     /// Batch verify organizations (admin only)
-    fn batch_verify_organizations(env: Env, admin: Address, org_ids: Vec<Address>) -> Result<u32, Error>;
+    fn batch_verify_organizations(
+        env: Env,
+        admin: Address,
+        org_ids: Vec<Address>,
+    ) -> Result<u32, Error>;
 
     /// Batch revoke organizations (admin only)
     fn batch_revoke_organizations(
@@ -66,7 +88,11 @@ pub trait VerificationTrait {
 pub struct VerificationImpl;
 
 impl VerificationTrait for VerificationImpl {
-    fn verify_organization(env: Env, admin: Address, org_id: Address) -> Result<VerificationMetadata, Error> {
+    fn verify_organization(
+        env: Env,
+        admin: Address,
+        org_id: Address,
+    ) -> Result<VerificationMetadata, Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
@@ -86,6 +112,9 @@ impl VerificationTrait for VerificationImpl {
         organization.verified_timestamp = Some(now);
 
         env.storage().persistent().set(&org_key, &organization);
+        env.storage()
+            .persistent()
+            .extend_ttl(&org_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Store verification metadata
         let metadata = VerificationMetadata {
@@ -99,6 +128,9 @@ impl VerificationTrait for VerificationImpl {
 
         let metadata_key = DataKey::VerificationMetadata(org_id.clone());
         env.storage().persistent().set(&metadata_key, &metadata);
+        env.storage()
+            .persistent()
+            .extend_ttl(&metadata_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Record verification event
         Self::record_verification_event(
@@ -110,10 +142,12 @@ impl VerificationTrait for VerificationImpl {
             None,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "org_verified"),),
-            (org_id.clone(), admin, now),
-        );
+        OrgVerified {
+            org_id: org_id.clone(),
+            admin,
+            timestamp: now,
+        }
+        .publish(&env);
 
         Ok(metadata)
     }
@@ -143,6 +177,9 @@ impl VerificationTrait for VerificationImpl {
         organization.verified_timestamp = None;
 
         env.storage().persistent().set(&org_key, &organization);
+        env.storage()
+            .persistent()
+            .extend_ttl(&org_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Update verification metadata
         let metadata = VerificationMetadata {
@@ -156,6 +193,9 @@ impl VerificationTrait for VerificationImpl {
 
         let metadata_key = DataKey::VerificationMetadata(org_id.clone());
         env.storage().persistent().set(&metadata_key, &metadata);
+        env.storage()
+            .persistent()
+            .extend_ttl(&metadata_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Record revocation event
         Self::record_verification_event(
@@ -167,8 +207,11 @@ impl VerificationTrait for VerificationImpl {
             Some(reason.clone()),
         );
 
-        env.events()
-            .publish((Symbol::new(&env, "org_unverified"),), (org_id.clone(), reason));
+        OrgUnverified {
+            org_id: org_id.clone(),
+            reason,
+        }
+        .publish(&env);
 
         Ok(metadata)
     }
@@ -203,7 +246,11 @@ impl VerificationTrait for VerificationImpl {
         Ok(org.verified_timestamp)
     }
 
-    fn get_verification_events(env: Env, org_id: Address, limit: u32) -> Result<Vec<VerificationEvent>, Error> {
+    fn get_verification_events(
+        env: Env,
+        org_id: Address,
+        limit: u32,
+    ) -> Result<Vec<VerificationEvent>, Error> {
         let events_key = DataKey::VerificationEvents(org_id);
         let all_events: Vec<VerificationEvent> = env
             .storage()
@@ -224,15 +271,23 @@ impl VerificationTrait for VerificationImpl {
         Ok(results)
     }
 
-    fn batch_verify_organizations(env: Env, admin: Address, org_ids: Vec<Address>) -> Result<u32, Error> {
+    fn batch_verify_organizations(
+        env: Env,
+        admin: Address,
+        org_ids: Vec<Address>,
+    ) -> Result<u32, Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+
+        if org_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::InvalidInput);
+        }
 
         let mut verified_count = 0u32;
 
         for i in 0..org_ids.len() {
             let org_id = org_ids.get(i).unwrap();
-            if let Ok(_) = Self::verify_organization(env.clone(), admin.clone(), org_id) {
+            if Self::verify_organization(env.clone(), admin.clone(), org_id).is_ok() {
                 verified_count += 1;
             }
         }
@@ -249,11 +304,17 @@ impl VerificationTrait for VerificationImpl {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
+        if org_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::InvalidInput);
+        }
+
         let mut revoked_count = 0u32;
 
         for i in 0..org_ids.len() {
             let org_id = org_ids.get(i).unwrap();
-            if let Ok(_) = Self::unverify_organization(env.clone(), admin.clone(), org_id, reason.clone()) {
+            if Self::unverify_organization(env.clone(), admin.clone(), org_id, reason.clone())
+                .is_ok()
+            {
                 revoked_count += 1;
             }
         }
@@ -264,17 +325,7 @@ impl VerificationTrait for VerificationImpl {
 
 impl VerificationImpl {
     fn require_admin(env: &Env, account: &Address) -> Result<(), Error> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-
-        if account == &stored_admin {
-            Ok(())
-        } else {
-            Err(Error::Unauthorized)
-        }
+        IdentityContract::require_role(env, account, Role::Admin)
     }
 
     fn record_verification_event(
@@ -302,5 +353,8 @@ impl VerificationImpl {
 
         events.push_back(event);
         env.storage().persistent().set(&events_key, &events);
+        env.storage()
+            .persistent()
+            .extend_ttl(&events_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 }

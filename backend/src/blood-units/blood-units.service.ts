@@ -2,17 +2,20 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
+  ServiceUnavailableException,
   Logger,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 
 import * as QRCode from 'qrcode';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 
 import { PermissionsService } from '../auth/permissions.service';
 import { DonorEligibilityService } from '../donor-eligibility/donor-eligibility.service';
 import { NotificationChannel } from '../notifications/enums/notification-channel.enum';
 import { NotificationsService } from '../notifications/notifications.service';
+import { ActorRegistryService, ActorType } from '../registry/actor-registry.service';
 import { BloodUnitTrail } from '../soroban/entities/blood-unit-trail.entity';
 import { SorobanService } from '../soroban/soroban.service';
 
@@ -36,6 +39,7 @@ import { OrganizationEntity } from '../organizations/entities/organization.entit
 interface AuthenticatedUserContext {
   id: string;
   role: string;
+  organizationId?: string;
 }
 
 @Injectable()
@@ -50,18 +54,19 @@ export class BloodUnitsService {
     private readonly permissionsService: PermissionsService,
     private readonly donorEligibilityService: DonorEligibilityService,
     private readonly quarantineService: QuarantineService,
+    private readonly actorRegistry: ActorRegistryService,
     private readonly eventEmitter: EventEmitter2,
     @InjectRepository(BloodUnitTrail)
 
     private readonly trailRepository: Repository<BloodUnitTrail>,
     @InjectRepository(BloodUnitEntity)
     private readonly bloodUnitRepository: Repository<BloodUnitEntity>,
-    @InjectRepository(BloodUnit)
-    private readonly inventoryRepository: Repository<BloodUnit>,
     @InjectRepository(TransferRecord)
     private readonly transferRepository: Repository<TransferRecord>,
     @InjectRepository(OrganizationEntity)
     private readonly orgRepository: Repository<OrganizationEntity>,
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
   ) {}
 
 
@@ -158,6 +163,7 @@ export class BloodUnitsService {
 
   async transferCustody(dto: TransferCustodyDto) {
     await this.assertUnitTransferable(dto.unitId);
+    await this.validateCustodyTransferActors(dto.fromAccount, dto.toAccount);
 
     const result = await this.sorobanService.transferCustody({
       unitId: dto.unitId,
@@ -184,35 +190,52 @@ export class BloodUnitsService {
     reason?: string,
     user?: AuthenticatedUserContext,
   ) {
-    const unit = await this.inventoryRepository.findOne({
-      where: { id: unitId },
-    });
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    if (!unit) {
-      throw new NotFoundException(`Blood unit ${unitId} not found`);
+    let unit: BloodUnit;
+    let transfer: TransferRecord;
+
+    try {
+      unit = await queryRunner.manager.findOne(BloodUnit, {
+        where: { id: unitId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!unit) {
+        throw new NotFoundException(`Blood unit ${unitId} not found`);
+      }
+
+      // Must be owner org
+      if (unit.organizationId !== (user as any)?.organizationId && user?.role !== 'admin') {
+        throw new BadRequestException('Only the owner organization can initiate a transfer');
+      }
+
+      if (unit.status !== BloodStatus.AVAILABLE) {
+        throw new BadRequestException(`Unit must be AVAILABLE to transfer (current: ${unit.status})`);
+      }
+
+      unit.status = BloodStatus.IN_TRANSFER;
+      await queryRunner.manager.save(unit);
+
+      transfer = queryRunner.manager.create(TransferRecord, {
+        bloodUnitId: unitId,
+        sourceOrgId: unit.organizationId,
+        destinationOrgId,
+        reason,
+        status: TransferStatus.PENDING,
+        initiatedByUserId: user?.id,
+      });
+      await queryRunner.manager.save(transfer);
+
+      await queryRunner.commitTransaction();
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
     }
-
-    // Must be owner org
-    if (unit.organizationId !== (user as any)?.organizationId && user?.role !== 'admin') {
-      throw new BadRequestException('Only the owner organization can initiate a transfer');
-    }
-
-    if (unit.status !== BloodStatus.AVAILABLE) {
-      throw new BadRequestException(`Unit must be AVAILABLE to transfer (current: ${unit.status})`);
-    }
-
-    unit.status = BloodStatus.IN_TRANSFER;
-    await this.inventoryRepository.save(unit);
-
-    const transfer = this.transferRepository.create({
-      bloodUnitId: unitId,
-      sourceOrgId: unit.organizationId,
-      destinationOrgId,
-      reason,
-      status: TransferStatus.PENDING,
-      initiatedByUserId: user?.id,
-    });
-    await this.transferRepository.save(transfer);
 
     this.eventEmitter.emit('blood-unit.transfer.initiated', {
       unitId,
@@ -235,40 +258,59 @@ export class BloodUnitsService {
    * Closes #465
    */
   async acceptOrganizationTransfer(unitId: string, user?: AuthenticatedUserContext) {
-    const unit = await this.inventoryRepository.findOne({
-      where: { id: unitId },
-    });
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    if (!unit) {
-      throw new NotFoundException(`Blood unit ${unitId} not found`);
+    let unit: BloodUnit;
+    let transfer: TransferRecord;
+    let previousOrgId: string;
+
+    try {
+      unit = await queryRunner.manager.findOne(BloodUnit, {
+        where: { id: unitId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!unit) {
+        throw new NotFoundException(`Blood unit ${unitId} not found`);
+      }
+
+      transfer = await queryRunner.manager.findOne(TransferRecord, {
+        where: {
+          bloodUnitId: unitId,
+          status: TransferStatus.PENDING,
+        },
+        order: { createdAt: 'DESC' },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!transfer) {
+        throw new BadRequestException('No pending transfer found for this unit');
+      }
+
+      // Must be destination org
+      if (transfer.destinationOrgId !== (user as any)?.organizationId && user?.role !== 'admin') {
+        throw new BadRequestException('Only the destination organization can accept the transfer');
+      }
+
+      previousOrgId = unit.organizationId;
+      unit.organizationId = transfer.destinationOrgId;
+      unit.status = BloodStatus.AVAILABLE;
+      await queryRunner.manager.save(unit);
+
+      transfer.status = TransferStatus.ACCEPTED;
+      transfer.acceptedByUserId = user?.id || null;
+      transfer.acceptedAt = new Date();
+      await queryRunner.manager.save(transfer);
+
+      await queryRunner.commitTransaction();
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
     }
-
-    const transfer = await this.transferRepository.findOne({
-      where: {
-        bloodUnitId: unitId,
-        status: TransferStatus.PENDING,
-      },
-      order: { createdAt: 'DESC' },
-    });
-
-    if (!transfer) {
-      throw new BadRequestException('No pending transfer found for this unit');
-    }
-
-    // Must be destination org
-    if (transfer.destinationOrgId !== (user as any)?.organizationId && user?.role !== 'admin') {
-      throw new BadRequestException('Only the destination organization can accept the transfer');
-    }
-
-    const previousOrgId = unit.organizationId;
-    unit.organizationId = transfer.destinationOrgId;
-    unit.status = BloodStatus.AVAILABLE;
-    await this.inventoryRepository.save(unit);
-
-    transfer.status = TransferStatus.ACCEPTED;
-    transfer.acceptedByUserId = user?.id || null;
-    transfer.acceptedAt = new Date();
-    await this.transferRepository.save(transfer);
 
     // Update Soroban - publish custody transfer to blockchain
     try {
@@ -279,6 +321,11 @@ export class BloodUnitsService {
         ]);
 
         if (sourceOrg?.blockchainAddress && destOrg?.blockchainAddress) {
+          // Verify both orgs are still registered actors before the on-chain call
+          await this.validateCustodyTransferActors(
+            sourceOrg.blockchainAddress,
+            destOrg.blockchainAddress,
+          );
           await this.sorobanService.transferCustody({
             unitId: Number(unit.blockchainUnitId),
             fromAccount: sourceOrg.blockchainAddress,
@@ -338,6 +385,13 @@ export class BloodUnitsService {
                 max: this.maxStorageTempC,
               },
             },
+            evidence: [
+              {
+                type: 'temperature_log',
+                fileId: `temp-log-${dto.unitId}-${Date.now()}`,
+                description: `Temperature reading: ${dto.temperature}C`,
+              },
+            ],
           },
           undefined,
         );
@@ -385,7 +439,22 @@ export class BloodUnitsService {
         source: 'blockchain',
       };
     } catch (error) {
-      throw new NotFoundException(`Blood unit ${unitId} not found`);
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const isNotFound =
+        message.toLowerCase().includes('not found') ||
+        message.toLowerCase().includes('no entry') ||
+        message.toLowerCase().includes('does not exist');
+      if (isNotFound) {
+        throw new NotFoundException(`Blood unit ${unitId} not found`);
+      }
+      this.logger.error(
+        `Blockchain error fetching trail for unit ${unitId}: ${message}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      throw new ServiceUnavailableException('Blockchain service is temporarily unavailable');
     }
   }
 
@@ -402,6 +471,10 @@ export class BloodUnitsService {
     bankId: string,
     user?: AuthenticatedUserContext,
   ) {
+    // Verify against the authoritative organisation registry first
+    await this.actorRegistry.assertActorType(bankId, ActorType.BLOOD_BANK);
+
+    // Secondary on-chain check (belt-and-suspenders)
     const isAuthorizedBank = await this.sorobanService.isBloodBank(bankId);
     if (!isAuthorizedBank) {
       throw new NotFoundException('Blood bank is not authorized on blockchain');
@@ -409,6 +482,36 @@ export class BloodUnitsService {
 
     if (user?.role) {
       this.permissionsService.assertIsBloodBankOrAdmin(user);
+    }
+  }
+
+  /**
+   * Verify that both custody-transfer endpoints are registered actors of the
+   * correct type before the on-chain call is submitted.
+   */
+  private async validateCustodyTransferActors(
+    fromAccount: string,
+    toAccount: string,
+  ): Promise<void> {
+    // Both sides must be verified organisations (blood bank or hospital)
+    const [fromOk, toOk] = await Promise.all([
+      this.actorRegistry.isVerifiedActor(fromAccount, ActorType.BLOOD_BANK).then(
+        (ok) => ok || this.actorRegistry.isVerifiedActor(fromAccount, ActorType.HOSPITAL),
+      ),
+      this.actorRegistry.isVerifiedActor(toAccount, ActorType.BLOOD_BANK).then(
+        (ok) => ok || this.actorRegistry.isVerifiedActor(toAccount, ActorType.HOSPITAL),
+      ),
+    ]);
+
+    if (!fromOk) {
+      throw new ForbiddenException(
+        `Source actor '${fromAccount}' is not a verified blood bank or hospital.`,
+      );
+    }
+    if (!toOk) {
+      throw new ForbiddenException(
+        `Destination actor '${toAccount}' is not a verified blood bank or hospital.`,
+      );
     }
   }
 
@@ -478,7 +581,9 @@ export class BloodUnitsService {
   private async assertUnitTransferable(blockchainUnitId: number): Promise<void> {
     const unit = await this.findByBlockchainUnitId(blockchainUnitId);
     if (!unit) {
-      return;
+      throw new NotFoundException(
+        `Blood unit with blockchain ID ${blockchainUnitId} not found`,
+      );
     }
 
     const normalizedStatus = String((unit as unknown as { status?: string }).status || '').toUpperCase();
