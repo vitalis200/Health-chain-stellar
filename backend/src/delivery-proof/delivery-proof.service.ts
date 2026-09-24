@@ -200,6 +200,61 @@ export class DeliveryProofService {
     };
   }
 
+  /**
+   * Deterministically serialises a value so that structurally identical
+   * evidence always produces the same digest (stable key ordering).
+   */
+  private stableStringify(value: unknown): string {
+    if (value === null || value === undefined) return 'null';
+    if (Array.isArray(value)) {
+      return `[${value.map((v) => this.stableStringify(v)).join(',')}]`;
+    }
+    if (typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      const keys = Object.keys(obj).sort();
+      return `{${keys
+        .map((k) => `${JSON.stringify(k)}:${this.stableStringify(obj[k])}`)
+        .join(',')}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  /**
+   * Builds a digest over every evidential field so the signature binds the
+   * cold-chain readings, delivery times, recipient and photo/location hashes
+   * (issue #1536). Without this, a legitimately signed payload could be
+   * replayed with tampered evidence.
+   */
+  private buildEvidenceDigest(dto: CreateDeliveryProofDto): string {
+    const evidence = {
+      deliveryId: dto.deliveryId,
+      orderId: dto.orderId,
+      requestId: dto.requestId,
+      riderId: dto.riderId,
+      signerRole: dto.signerRole,
+      signedAt: dto.signedAt,
+      pickupTimestamp: dto.pickupTimestamp,
+      deliveredAt: dto.deliveredAt,
+      recipientName: dto.recipientName,
+      recipientSignatureUrl: dto.recipientSignatureUrl,
+      recipientSignatureHash: dto.recipientSignatureHash,
+      temperatureReadings: dto.temperatureReadings,
+      temperatureCelsius: dto.temperatureCelsius,
+      isTemperatureCompliant: dto.isTemperatureCompliant,
+      photoHashes: dto.photoHashes,
+      photoUrl: dto.photoUrl,
+      pickupLocationHash: dto.pickupLocationHash,
+      deliveryLocationHash: dto.deliveryLocationHash,
+      locationHash: dto.locationHash,
+      notes: dto.notes,
+      evidenceDigestReferences: dto.evidenceDigestReferences,
+    };
+    return crypto
+      .createHash('sha256')
+      .update(this.stableStringify(evidence))
+      .digest('hex');
+  }
+
   async create(dto: CreateDeliveryProofDto, actor?: DeliveryProofActor): Promise<DeliveryProofEntity> {
     this.assertEvidenceDigestReferences(dto.evidenceDigestReferences);
 
@@ -219,88 +274,6 @@ export class DeliveryProofService {
 
     if (deliveredAt < pickupTimestamp) {
       throw new BadRequestException(
-        'deliveredAt must be after pickupTimestamp',
-      );
-    }
-    if (signedAt > new Date()) {
-      throw new BadRequestException('signedAt cannot be in the future');
-    }
-    if (!dto.temperatureReadings || dto.temperatureReadings.length === 0) {
-      throw new BadRequestException(
-        'At least one temperature reading is required',
-      );
-    }
+        'deliveredAt must be af
 
-    // Require all custody handoffs confirmed before delivery can be recorded (#380)
-    await this.custodyService.assertCustodyComplete(dto.orderId);
-
-    const trustedSigner = this.resolveTrustedSigner(dto.signerKeyId);
-    if (trustedSigner.publicKey !== dto.signerPublicKey) {
-      throw new BadRequestException('Signer key does not match trusted rotation set');
-    }
-
-    const signedPayload = this.buildSignedPayload({
-      deliveryId: dto.deliveryId,
-      orderId: dto.orderId,
-      requestId: dto.requestId,
-      riderId: dto.riderId,
-      signerRole: dto.signerRole,
-      signedAt: dto.signedAt,
-      evidenceDigestReferences: dto.evidenceDigestReferences,
-    });
-    const payloadDigest = crypto.createHash('sha256').update(signedPayload).digest('hex');
-    try {
-      const keypair = Keypair.fromPublicKey(dto.signerPublicKey);
-      const signatureBytes = Buffer.from(dto.signature, 'base64');
-      const digestBytes = Buffer.from(payloadDigest, 'hex');
-      if (!keypair.verify(digestBytes, signatureBytes)) {
-        throw new BadRequestException('Signature verification failed');
-      }
-    } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-      throw new BadRequestException('Signature verification failed');
-    }
-
-    const isTemperatureCompliant = dto.temperatureReadings.every(
-      (t) => t >= TEMP_MIN_CELSIUS && t <= TEMP_MAX_CELSIUS,
-    );
-
-    const trustedTimestampAt = new Date();
-    const timestampAnchorHash =
-      dto.externalTimestampAnchorHash ??
-      crypto
-        .createHash('sha256')
-        .update(`${dto.deliveryId}:${dto.requestId}:${trustedTimestampAt.toISOString()}`)
-        .digest('hex');
-
-    const proof = this.proofRepo.create({
-      deliveryId: dto.deliveryId,
-      orderId: dto.orderId,
-      requestId: dto.requestId,
-      riderId: dto.riderId,
-      pickupTimestamp,
-      pickupLocationHash: dto.pickupLocationHash ?? null,
-      deliveredAt,
-      deliveryLocationHash: dto.deliveryLocationHash ?? null,
-      recipientName: dto.recipientName,
-      recipientSignatureUrl: dto.recipientSignatureUrl ?? null,
-      recipientSignatureHash: dto.recipientSignatureHash ?? null,
-      photoUrl: dto.photoUrl ?? null,
-      photoHashes: dto.photoHashes ?? [],
-      temperatureReadings: dto.temperatureReadings,
-      temperatureCelsius: dto.temperatureCelsius ?? null,
-      notes: dto.notes ?? null,
-      isTemperatureCompliant,
-      verified: true,
-      signerKeyId: dto.signerKeyId,
-      signerPublicKey: dto.signerPublicKey,
-      signerRole: dto.signerRole,
-      signedAt,
-      proofSignature: dto.signature,
-      proofPayloadDigest: payloadDigest,
-      trustedTimestampAt,
-
-
-/* … truncated 5374 chars — edit only what you need near the top … */
+/* … truncated 3113 chars — edit only what you need near the top … */
