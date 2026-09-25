@@ -1,18 +1,16 @@
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
+use libfuzzer_sys::fuzz_target;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     Address, Env, String as SorobanString, Symbol,
 };
 
-
 use health_chain_contract::{
     BloodComponent, BloodStatus, BloodType, CustodyStatus, Error, HealthChainContract,
     HealthChainContractClient,
 };
-
 
 #[derive(Arbitrary, Debug, Clone)]
 enum CustodyOperation {
@@ -51,26 +49,29 @@ fuzz_target!(|input: FuzzInput| {
     let admin = Address::generate(&env);
     let contract_id = env.register(HealthChainContract, ());
     let client = HealthChainContractClient::new(&env, &contract_id);
-    
+
     client.initialize(&admin);
 
     // Register blood bank and hospital
     let bank = Address::generate(&env);
     let hospital = Address::generate(&env);
     let other_address = Address::generate(&env);
-    
+
     client.register_blood_bank(&bank);
     client.register_hospital(&hospital);
 
     // Create blood units with different conditions
     let mut unit_ids = Vec::new();
     let base_time = env.ledger().timestamp();
-    
+
     for (idx, condition) in input.unit_conditions.iter().enumerate().take(10) {
+        // register_blood enforces MIN_SHELF_LIFE_DAYS (1 day), so the short-lived
+        // conditions sit just past that floor and are pushed over the edge by
+        // AdvanceTime (up to 1 day per operation).
         let expiration = match condition {
             UnitConditionFuzz::Normal => base_time + 7 * 86400, // 7 days
-            UnitConditionFuzz::NearExpiry => base_time + 1800,  // 30 minutes
-            UnitConditionFuzz::Expired => base_time + 100,      // Already expired
+            UnitConditionFuzz::NearExpiry => base_time + 86400 + 1800, // 1 day + 30 minutes
+            UnitConditionFuzz::Expired => base_time + 86400, // expires after the first full-day advance
         };
 
         let unit_id = client.register_blood(
@@ -81,9 +82,9 @@ fuzz_target!(|input: FuzzInput| {
             &expiration,
             &Some(Symbol::new(&env, &format!("DONOR{}", idx))),
         );
-        
+
         unit_ids.push(unit_id);
-        
+
         // Allocate to hospital to prepare for transfer
         let _ = client.allocate_blood(&bank, &unit_id, &hospital);
     }
@@ -99,34 +100,42 @@ fuzz_target!(|input: FuzzInput| {
                 if unit_ids.is_empty() {
                     continue;
                 }
-                
+
                 let unit_idx = (*unit_id as usize) % unit_ids.len();
                 let unit_id = unit_ids[unit_idx];
 
                 // Check invariant: unit should not have pending transfer
                 let unit_result = client.try_get_blood_unit(&unit_id);
-                if let Ok(unit) = unit_result {
+                if let Ok(Ok(unit)) = unit_result {
                     // Only initiate if status is Reserved
                     if unit.status == BloodStatus::Reserved {
                         let result = client.try_initiate_transfer(&bank, &unit_id);
-                        
-                        if let Ok(event_id) = result {
+
+                        if let Ok(Ok(event_id)) = result {
                             pending_event_ids.push(event_id.clone());
-                            
+
                             // INVARIANT 1: A unit can never have two pending transfers simultaneously
-                            let custody_event = client.get_custody_event(&event_id).unwrap();
+                            let custody_event = client.get_custody_event(&event_id);
                             assert_eq!(custody_event.status, CustodyStatus::Pending);
-                            
+
                             // Verify no other pending transfers for this unit
-                            let count = pending_event_ids.iter().filter(|eid| {
-                                if let Ok(evt) = client.try_get_custody_event(eid) {
-                                    evt.unit_id == unit_id && evt.status == CustodyStatus::Pending
-                                } else {
-                                    false
-                                }
-                            }).count();
-                            
-                            assert!(count <= 1, "INVARIANT VIOLATION: Multiple pending transfers for unit {}", unit_id);
+                            let count = pending_event_ids
+                                .iter()
+                                .filter(|eid| {
+                                    if let Ok(Ok(evt)) = client.try_get_custody_event(eid) {
+                                        evt.unit_id == unit_id
+                                            && evt.status == CustodyStatus::Pending
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .count();
+
+                            assert!(
+                                count <= 1,
+                                "INVARIANT VIOLATION: Multiple pending transfers for unit {}",
+                                unit_id
+                            );
                         }
                     }
                 }
@@ -136,22 +145,22 @@ fuzz_target!(|input: FuzzInput| {
                 if pending_event_ids.is_empty() {
                     continue;
                 }
-                
+
                 let idx = (*event_id_index as usize) % pending_event_ids.len();
                 let event_id = pending_event_ids[idx].clone();
 
                 let custody_event_result = client.try_get_custody_event(&event_id);
-                if let Ok(custody_event) = custody_event_result {
+                if let Ok(Ok(custody_event)) = custody_event_result {
                     if custody_event.status == CustodyStatus::Pending {
                         let unit_id = custody_event.unit_id;
                         let old_unit = client.get_blood_unit(&unit_id);
-                        
+
                         let result = client.try_confirm_transfer(&hospital, &event_id);
-                        
+
                         // INVARIANT 5: When unit expires during transit, recovery event is emitted
                         if result.is_err() {
                             // Check if this was a recovery scenario (unit expiry)
-                            if let Ok(updated_event) = client.try_get_custody_event(&event_id) {
+                            if let Ok(Ok(updated_event)) = client.try_get_custody_event(&event_id) {
                                 // If custody event status is Recovered, unit must be Expired
                                 if updated_event.status == CustodyStatus::Recovered {
                                     let recovered_unit = client.get_blood_unit(&unit_id);
@@ -161,24 +170,27 @@ fuzz_target!(|input: FuzzInput| {
                                 }
                             }
                         }
-                        
+
                         if result.is_ok() {
                             // INVARIANT 2: A confirmed transfer always updates current_custodian
                             let updated_unit = client.get_blood_unit(&unit_id);
-                            assert_eq!(updated_unit.status, BloodStatus::Delivered, 
+                            assert_eq!(updated_unit.status, BloodStatus::Delivered,
                                 "INVARIANT VIOLATION: Confirmed transfer didn't update status to Delivered");
-                            
+
                             // INVARIANT 3: Confirmed transfer updates custody event status
-                            let updated_event = client.get_custody_event(&event_id).unwrap();
+                            let updated_event = client.get_custody_event(&event_id);
                             assert_eq!(updated_event.status, CustodyStatus::Confirmed,
                                 "INVARIANT VIOLATION: Confirmed transfer didn't update event status");
-                            
+
                             confirmed_transfers.push(unit_id);
                             pending_event_ids.remove(idx);
-                            
+
                             // INVARIANT 4: total_custody_events equals confirmed transfers only
                             let metadata = client.get_custody_trail_metadata(&unit_id);
-                            let confirmed_count = confirmed_transfers.iter().filter(|&&id| id == unit_id).count();
+                            let confirmed_count = confirmed_transfers
+                                .iter()
+                                .filter(|&&id| id == unit_id)
+                                .count();
                             assert_eq!(metadata.total_events as usize, confirmed_count,
                                 "INVARIANT VIOLATION: total_custody_events ({}) != confirmed transfers ({})",
                                 metadata.total_events, confirmed_count);
@@ -191,42 +203,45 @@ fuzz_target!(|input: FuzzInput| {
                 if pending_event_ids.is_empty() {
                     continue;
                 }
-                
+
                 let idx = (*event_id_index as usize) % pending_event_ids.len();
                 let event_id = pending_event_ids[idx].clone();
 
                 let custody_event_result = client.try_get_custody_event(&event_id);
-                if let Ok(custody_event) = custody_event_result {
+                if let Ok(Ok(custody_event)) = custody_event_result {
                     if custody_event.status == CustodyStatus::Pending {
                         let unit_id = custody_event.unit_id;
-                        
+
                         // Advance time to make transfer cancellable
                         let current_time = env.ledger().timestamp();
                         env.ledger().with_mut(|li| {
                             li.timestamp = current_time + 1800; // 30 minutes
                         });
-                        
+
                         let result = client.try_cancel_transfer(&bank, &event_id);
-                        
+
                         if result.is_ok() {
                             // INVARIANT 6: Cancelled transfers recover the unit to a valid state (Reserved)
                             // This ensures failed transfers don't permanently lose inventory
                             let updated_unit = client.get_blood_unit(&unit_id);
                             assert_eq!(updated_unit.status, BloodStatus::Reserved,
                                 "INVARIANT VIOLATION: Cancelled transfer didn't recover unit to Reserved");
-                            
+
                             // INVARIANT 7: Cancelled transfer marks custody event as Recovered
                             // Recovered status indicates recovery action was taken (not permanent cancellation)
-                            let updated_event = client.get_custody_event(&event_id).unwrap();
+                            let updated_event = client.get_custody_event(&event_id);
                             assert_eq!(updated_event.status, CustodyStatus::Recovered,
                                 "INVARIANT VIOLATION: Cancelled transfer didn't mark custody event as Recovered");
-                            
+
                             pending_event_ids.remove(idx);
-                            
+
                             // INVARIANT 8: Recovered transfers return unit to reusable state
                             // Backend can now re-allocate this unit for another transfer
-                            assert_eq!(updated_unit.status, BloodStatus::Reserved,
-                                "INVARIANT VIOLATION: Recovered unit not in valid reusable state");
+                            assert_eq!(
+                                updated_unit.status,
+                                BloodStatus::Reserved,
+                                "INVARIANT VIOLATION: Recovered unit not in valid reusable state"
+                            );
                         }
                     }
                 }
@@ -244,17 +259,23 @@ fuzz_target!(|input: FuzzInput| {
         // Global invariant check after every operation
         for unit_id in &unit_ids {
             // Count pending transfers for this unit
-            let pending_count = pending_event_ids.iter().filter(|eid| {
-                if let Ok(evt) = client.try_get_custody_event(eid) {
-                    evt.unit_id == *unit_id && evt.status == CustodyStatus::Pending
-                } else {
-                    false
-                }
-            }).count();
-            
-            assert!(pending_count <= 1, 
-                "GLOBAL INVARIANT VIOLATION: Unit {} has {} pending transfers", 
-                unit_id, pending_count);
+            let pending_count = pending_event_ids
+                .iter()
+                .filter(|eid| {
+                    if let Ok(Ok(evt)) = client.try_get_custody_event(eid) {
+                        evt.unit_id == *unit_id && evt.status == CustodyStatus::Pending
+                    } else {
+                        false
+                    }
+                })
+                .count();
+
+            assert!(
+                pending_count <= 1,
+                "GLOBAL INVARIANT VIOLATION: Unit {} has {} pending transfers",
+                unit_id,
+                pending_count
+            );
 
             // GLOBAL INVARIANT: Verify recovered units are in valid reusable state
             // After recovery (expiry during transit or cancellation), unit must be reusable
@@ -263,17 +284,21 @@ fuzz_target!(|input: FuzzInput| {
                 // Valid states for potential reallocation
             } else if unit.status == BloodStatus::Expired || unit.status == BloodStatus::Discarded {
                 // Terminal states - unit cannot be recovered
-            } else if unit.status == BloodStatus::InTransit || unit.status == BloodStatus::Delivered {
+            } else if unit.status == BloodStatus::InTransit || unit.status == BloodStatus::Delivered
+            {
                 // In progress or completed - ensure consistency with pending events
                 let has_pending = pending_event_ids.iter().any(|eid| {
-                    if let Ok(evt) = client.try_get_custody_event(eid) {
+                    if let Ok(Ok(evt)) = client.try_get_custody_event(eid) {
                         evt.unit_id == *unit_id && evt.status == CustodyStatus::Pending
                     } else {
                         false
                     }
                 });
-                assert!(has_pending || unit.status == BloodStatus::Delivered,
-                    "GLOBAL INVARIANT VIOLATION: Unit {} in transit but no pending transfer", unit_id);
+                assert!(
+                    has_pending || unit.status == BloodStatus::Delivered,
+                    "GLOBAL INVARIANT VIOLATION: Unit {} in transit but no pending transfer",
+                    unit_id
+                );
             }
         }
     }

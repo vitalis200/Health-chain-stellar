@@ -83,6 +83,10 @@ pub enum Error {
     /// gross payment amount.  Raised during `create_payment` to close the
     /// fee-structuring bypass of the multisig high-value threshold (issue #1400).
     FeesExceedCap = 37,
+    /// `raise_dispute` evidence digest is not a 32-byte SHA-256 hash.
+    InvalidEvidenceDigest = 38,
+    /// The same unit ID appears more than once in a caller-supplied list.
+    DuplicateUnitId = 39,
 }
 
 // Alias for issue/docs terminology.
@@ -1521,6 +1525,8 @@ impl HealthChainContract {
         // If unit expiration passed while in transit, mark as recovered with explicit event
         if unit.expiration_date <= current_time {
             unit.status = BloodStatus::Expired;
+            // The recipient will never receive an expired unit (#1436).
+            clear_hospital_allocation(&env, &mut unit, unit_id);
             env.storage()
                 .persistent()
                 .set(&DataKey::Unit(unit_id), &unit);
@@ -1791,6 +1797,9 @@ impl HealthChainContract {
 
         // Update unit
         unit.status = BloodStatus::Discarded;
+        // Discarded is terminal: drop any undelivered hospital allocation so
+        // the unit stops appearing in query_by_hospital (#1436).
+        clear_hospital_allocation(&env, &mut unit, unit_id);
 
         env.storage()
             .persistent()
@@ -1929,46 +1938,37 @@ impl HealthChainContract {
             return Err(Error::InvalidStatus);
         }
 
+        // Fix #1434: never release expired stock back into the active pool.
+        // A unit may have been quarantined while fresh and expired while
+        // waiting for review; it can still be discarded.
+        if matches!(disposition, QuarantineDisposition::Release)
+            && unit.expiration_date <= env.ledger().timestamp()
+        {
+            return Err(Error::UnitExpired);
+        }
+
         let new_status = match disposition {
             QuarantineDisposition::Release => BloodStatus::Available,
             QuarantineDisposition::Discard => BloodStatus::Discarded,
         };
 
         unit.status = new_status;
+
+        // Fix #1323 / #1436: a unit that was Reserved or InTransit when
+        // quarantine_blood was called still carries its hospital allocation.
+        // Whether it is released back to inventory or discarded, that hospital
+        // will not receive it, so clear the allocation and HospitalUnits index.
+        // Without this, query_by_hospital would return a phantom allocation
+        // forever, and after a re-allocation the unit would appear under two
+        // hospitals. This mirrors the cleanup already done in cancel_allocation.
+        clear_hospital_allocation(&env, &mut unit, unit_id);
+
         env.storage()
             .persistent()
             .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, new_status);
-
-        // Fix #1323: when releasing a unit that was previously Reserved or
-        // InTransit (i.e. it had a hospital allocation when quarantine_blood was
-        // called), clear the stale allocation fields and remove the unit from the
-        // HospitalUnits index.  Without this, query_by_hospital would return a
-        // phantom allocation for the original hospital forever, and after a second
-        // allocation the unit would appear under two hospitals simultaneously.
-        // This mirrors the cleanup already done in cancel_allocation.
-        if new_status == BloodStatus::Available {
-            let stale_hospital = unit.recipient_hospital.clone();
-            if stale_hospital.is_some() {
-                // Reload the unit from the map so we can clear its fields.
-                let mut cleared: BloodUnit = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Unit(unit_id))
-                    .ok_or(Error::UnitNotFound)?;
-                cleared.recipient_hospital = None;
-                cleared.allocation_timestamp = None;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Unit(unit_id), &cleared);
-
-                if let Some(ref hosp) = stale_hospital {
-                    deindex_hospital_unit(&env, hosp, unit_id);
-                }
-            }
-        }
 
         record_status_change(&env, unit_id, old_status, new_status, caller.clone());
 
@@ -2126,6 +2126,21 @@ pub(crate) fn deindex_hospital_unit(env: &Env, hospital_id: &Address, unit_id: u
         }
     }
     env.storage().persistent().set(&key, &filtered);
+}
+
+/// Clear `unit`'s hospital allocation (`recipient_hospital` /
+/// `allocation_timestamp`) and remove it from that hospital's HospitalUnits
+/// index. The caller is responsible for persisting `unit` afterwards.
+///
+/// Call whenever an allocated-but-undelivered unit leaves the allocation
+/// without reaching the hospital (released back to inventory, discarded or
+/// expired). Otherwise `query_by_hospital` keeps returning a phantom
+/// allocation for a hospital that will never receive the unit (#1323, #1436).
+pub(crate) fn clear_hospital_allocation(env: &Env, unit: &mut BloodUnit, unit_id: u64) {
+    if let Some(hospital) = unit.recipient_hospital.take() {
+        unit.allocation_timestamp = None;
+        deindex_hospital_unit(env, &hospital, unit_id);
+    }
 }
 
 /// Append `unit_id` to the DonorUnits index for `(bank_id, donor_id)` and the
@@ -3216,6 +3231,12 @@ impl HealthChainContract {
                 .set(&DataKey::Payment(payment_id), &payment);
         }
 
+        // Persist the vote; without this every call starts from an empty
+        // approval set, so votes never accumulate and duplicates go undetected.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingApprovalRecord(payment_id), &approval);
+
         Ok(approval.executed)
     }
 
@@ -3241,8 +3262,6 @@ impl HealthChainContract {
             .persistent()
             .get(&DataKey::Payment(payment_id))
             .ok_or(Error::PaymentNotFound)?;
-
-        let mut payment = payments.get(payment_id).ok_or(Error::PaymentNotFound)?;
 
         if raised_by != payment.payer && raised_by != payment.payee {
             return Err(Error::Unauthorized);
@@ -3287,6 +3306,10 @@ impl HealthChainContract {
         env.storage()
             .persistent()
             .set(&DataKey::Dispute(dispute_id), &dispute);
+        // The deadline drives process_expired_disputes' auto-refund.
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeMetadata(dispute_id), &metadata);
 
         env.storage()
             .instance()
@@ -3500,6 +3523,13 @@ impl HealthChainContract {
                 .checked_add(refund_amount)
                 .ok_or(Error::ArithmeticError)?;
             processed = processed.checked_add(1).ok_or(Error::ArithmeticError)?;
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment.id), &payment);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id), &dispute);
 
             env.events().publish(
                 (
@@ -3878,6 +3908,16 @@ impl HealthChainContract {
 
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).unwrap();
+
+            // Fix #1433: a repeated ID would count the same unit's quantity
+            // twice and could mark the request Fulfilled with less blood
+            // actually delivered.
+            for j in 0..i {
+                if unit_ids.get(j).unwrap() == unit_id {
+                    return Err(Error::DuplicateUnitId);
+                }
+            }
+
             let unit: BloodUnit = env
                 .storage()
                 .persistent()
@@ -6442,11 +6482,12 @@ mod test {
         env.mock_all_auths();
         client.approve_request(&bank, &request_id, &unit_ids);
 
-        let request: BloodRequest = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Request(request_id))
-            .unwrap();
+        let request: BloodRequest = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
+        });
 
         assert_eq!(request.status, RequestStatus::Approved);
         assert_eq!(request.fulfilled_quantity_ml, 550);
@@ -6494,11 +6535,12 @@ mod test {
         env.mock_all_auths();
         client.approve_request(&bank, &request_id, &unit_ids);
 
-        let request: BloodRequest = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Request(request_id))
-            .unwrap();
+        let request: BloodRequest = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
+        });
 
         assert_eq!(request.status, RequestStatus::InProgress);
         assert_eq!(request.fulfilled_quantity_ml, 200);
@@ -7017,9 +7059,6 @@ mod test {
             &expiration,
             &Some(symbol_short!("donor2")),
         );
-
-        client.allocate_blood(&bank, &unit_id_1, &hospital);
-        client.allocate_blood(&bank, &unit_id_2, &hospital);
 
         let request_id = client.create_request(
             &hospital,
@@ -9242,6 +9281,8 @@ mod test {
         env.mock_all_auths();
         client.allocate_blood(&bank, &unit_id, &hospital);
         env.mock_all_auths();
+        client.initiate_transfer(&bank, &unit_id);
+        env.mock_all_auths();
         client.confirm_delivery(&hospital, &unit_id);
 
         assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Delivered);
@@ -9370,9 +9411,9 @@ mod test {
     fn test_is_eligible_for_archival_boundary() {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        env.ledger().with_mut(|l| l.timestamp = 10_000_000);
 
-        let bank = env.current_contract_address();
+        let bank = Address::generate(&env);
         let terminal_unit = BloodUnit {
             id: 1,
             blood_type: BloodType::OPositive,
@@ -9450,7 +9491,7 @@ mod test {
     fn test_is_eligible_for_archival_non_terminal_unit() {
         let env = Env::default();
         env.mock_all_auths();
-        let bank = env.current_contract_address();
+        let bank = Address::generate(&env);
 
         let non_terminal_unit = BloodUnit {
             id: 2,
@@ -9553,12 +9594,14 @@ mod test {
             &BloodType::OPositive,
             &BloodComponent::WholeBlood,
             &450,
-            &(env.ledger().timestamp() + 365 * 86400),
+            &(env.ledger().timestamp() + 35 * 86400),
             &None,
         );
 
         env.mock_all_auths();
         client.allocate_blood(&bank, &unit_id, &hospital);
+        env.mock_all_auths();
+        client.initiate_transfer(&bank, &unit_id);
         env.mock_all_auths();
         client.confirm_delivery(&hospital, &unit_id);
 
@@ -9585,5 +9628,228 @@ mod test {
 
         // History was compacted; the summary must now be retrievable.
         assert!(client.get_history_summary(&unit_id).is_some());
+    }
+
+    // ── #1436: terminal transitions must drop undelivered hospital allocations ──
+
+    /// Registers a bank and one fresh unit allocated to `hospital`.
+    fn allocated_unit(
+        env: &Env,
+        client: &HealthChainContractClient<'_>,
+        hospital: &Address,
+    ) -> (Address, u64) {
+        let bank = Address::generate(env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+        let unit_id = client.register_blood(
+            &bank,
+            &BloodType::OPositive,
+            &BloodComponent::WholeBlood,
+            &450,
+            &(env.ledger().timestamp() + 86400),
+            &None,
+        );
+        client.allocate_blood(&bank, &unit_id, hospital);
+        assert_eq!(client.query_by_hospital(hospital, &0).len(), 1);
+        (bank, unit_id)
+    }
+
+    fn assert_allocation_cleared(
+        client: &HealthChainContractClient<'_>,
+        hospital: &Address,
+        unit_id: u64,
+    ) {
+        assert_eq!(client.query_by_hospital(hospital, &0).len(), 0);
+        let unit = client.get_blood_unit(&unit_id);
+        assert_eq!(unit.recipient_hospital, None);
+        assert_eq!(unit.allocation_timestamp, None);
+    }
+
+    #[test]
+    fn test_withdraw_blood_clears_hospital_allocation() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let (bank, unit_id) = allocated_unit(&env, &client, &hospital);
+
+        client.withdraw_blood(&bank, &unit_id, &WithdrawalReason::Other);
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+        assert_allocation_cleared(&client, &hospital, unit_id);
+    }
+
+    #[test]
+    fn test_expire_unit_clears_hospital_allocation() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let (_, unit_id) = allocated_unit(&env, &client, &hospital);
+
+        env.ledger().with_mut(|l| l.timestamp += 86400);
+        client.expire_unit(&unit_id);
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Expired);
+        assert_allocation_cleared(&client, &hospital, unit_id);
+    }
+
+    #[test]
+    fn test_check_and_expire_batch_clears_hospital_allocation() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let (_, unit_id) = allocated_unit(&env, &client, &hospital);
+
+        env.ledger().with_mut(|l| l.timestamp += 86400);
+        let expired = client.check_and_expire_batch(&vec![&env, unit_id]);
+
+        assert_eq!(expired, vec![&env, unit_id]);
+        assert_allocation_cleared(&client, &hospital, unit_id);
+    }
+
+    #[test]
+    fn test_expire_unit_keeps_delivered_allocation() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let (bank, unit_id) = allocated_unit(&env, &client, &hospital);
+        client.initiate_transfer(&bank, &unit_id);
+        client.confirm_delivery(&hospital, &unit_id);
+
+        env.ledger().with_mut(|l| l.timestamp += 86400);
+        client.expire_unit(&unit_id);
+
+        // The hospital really received this unit, so it stays attributed.
+        assert_eq!(client.query_by_hospital(&hospital, &0).len(), 1);
+        assert_eq!(
+            client.get_blood_unit(&unit_id).recipient_hospital,
+            Some(hospital)
+        );
+    }
+
+    #[test]
+    fn test_finalize_quarantine_discard_clears_hospital_allocation() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let (bank, unit_id) = allocated_unit(&env, &client, &hospital);
+
+        client.quarantine_blood(&bank, &unit_id, &QuarantineReason::TemperatureBreach);
+        client.finalize_quarantine(
+            &bank,
+            &unit_id,
+            &QuarantineReason::TemperatureBreach,
+            &QuarantineDisposition::Discard,
+        );
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+        assert_allocation_cleared(&client, &hospital, unit_id);
+    }
+
+    #[test]
+    fn test_finalize_quarantine_release_clears_hospital_allocation() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let (bank, unit_id) = allocated_unit(&env, &client, &hospital);
+
+        client.quarantine_blood(&bank, &unit_id, &QuarantineReason::TemperatureBreach);
+        client.finalize_quarantine(
+            &bank,
+            &unit_id,
+            &QuarantineReason::TemperatureBreach,
+            &QuarantineDisposition::Release,
+        );
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Available);
+        assert_allocation_cleared(&client, &hospital, unit_id);
+    }
+
+    // ── #1434: quarantine release must not resurrect expired stock ──
+
+    #[test]
+    fn test_finalize_quarantine_release_rejects_expired_unit() {
+        let env = Env::default();
+        let (_, _admin, client) = setup_contract_with_admin(&env);
+        let bank = Address::generate(&env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+        let unit_id = client.register_blood(
+            &bank,
+            &BloodType::OPositive,
+            &BloodComponent::WholeBlood,
+            &450,
+            &(env.ledger().timestamp() + 86400),
+            &None,
+        );
+        client.quarantine_blood(&bank, &unit_id, &QuarantineReason::ScreeningFailure);
+
+        // Expires while awaiting quarantine review (exactly at the boundary).
+        env.ledger().with_mut(|l| l.timestamp += 86400);
+
+        let release = client.try_finalize_quarantine(
+            &bank,
+            &unit_id,
+            &QuarantineReason::ScreeningFailure,
+            &QuarantineDisposition::Release,
+        );
+        assert_eq!(release, Err(Ok(Error::UnitExpired)));
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Quarantined);
+
+        // Discarding expired stock is still allowed.
+        client.finalize_quarantine(
+            &bank,
+            &unit_id,
+            &QuarantineReason::ScreeningFailure,
+            &QuarantineDisposition::Discard,
+        );
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+    }
+
+    // ── #1433: duplicate unit IDs must not inflate delivered quantity ──
+
+    #[test]
+    fn test_fulfill_request_rejects_duplicate_unit_ids() {
+        let env = Env::default();
+        let (contract_id, _, hospital, client) = setup_contract_with_hospital(&env);
+        let bank = Address::generate(&env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+
+        let current_time = env.ledger().timestamp();
+        let expiration = current_time + (7 * 86400);
+        let unit_id_1 = client.register_blood(
+            &bank,
+            &BloodType::APositive,
+            &BloodComponent::WholeBlood,
+            &250,
+            &expiration,
+            &Some(symbol_short!("donor1")),
+        );
+        let unit_id_2 = client.register_blood(
+            &bank,
+            &BloodType::APositive,
+            &BloodComponent::WholeBlood,
+            &250,
+            &expiration,
+            &Some(symbol_short!("donor2")),
+        );
+        let request_id = client.create_request(
+            &hospital,
+            &BloodType::APositive,
+            &500,
+            &UrgencyLevel::Urgent,
+            &(current_time + 3600),
+            &String::from_str(&env, "Ward D"),
+        );
+        client.approve_request(&bank, &request_id, &vec![&env, unit_id_1, unit_id_2]);
+
+        // 250 + 250 would equal the requested 500 ml with only one unit delivered.
+        let result =
+            client.try_fulfill_request(&bank, &request_id, &vec![&env, unit_id_1, unit_id_1]);
+        assert_eq!(result, Err(Ok(Error::DuplicateUnitId)));
+
+        let request: BloodRequest = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
+        });
+        assert_eq!(request.status, RequestStatus::Approved);
+        assert_eq!(client.get_blood_status(&unit_id_1), BloodStatus::Reserved);
+        assert_eq!(client.get_blood_status(&unit_id_2), BloodStatus::Reserved);
     }
 }

@@ -506,7 +506,8 @@ fn auto_refund_after_timeout() {
     let payer = Address::generate(&env);
     let payee = Address::generate(&env);
     let asset = Address::generate(&env);
-    let raiser = Address::generate(&env);
+    // raise_dispute is restricted to the payment's payer/payee (#1391).
+    let raiser = payer.clone();
 
     client.set_dispute_timeout(&10);
     let payment_id = client.create_payment(
@@ -602,7 +603,8 @@ fn no_refund_before_deadline() {
     let payer = Address::generate(&env);
     let payee = Address::generate(&env);
     let asset = Address::generate(&env);
-    let raiser = Address::generate(&env);
+    // raise_dispute is restricted to the payment's payer/payee (#1391).
+    let raiser = payer.clone();
 
     client.set_dispute_timeout(&10);
     let payment_id = client.create_payment(
@@ -769,7 +771,8 @@ fn manual_resolution_prevents_refund() {
     let payer = Address::generate(&env);
     let payee = Address::generate(&env);
     let asset = Address::generate(&env);
-    let raiser = Address::generate(&env);
+    // raise_dispute is restricted to the payment's payer/payee (#1391).
+    let raiser = payer.clone();
 
     client.set_dispute_timeout(&10);
     let payment_id = client.create_payment(
@@ -1382,8 +1385,7 @@ fn test_create_payment_rejects_fee_structuring_attack() {
         fixed_fee: 0,
     };
 
-    let result =
-        client.try_create_payment(&1, &payer, &payee, &gross, &asset, &attack_fee, &admin);
+    let result = client.try_create_payment(&1, &payer, &payee, &gross, &asset, &attack_fee, &admin);
 
     assert!(result.is_err(), "fee-structuring attack must be rejected");
     if let Err(Ok(e)) = result {
@@ -1481,9 +1483,9 @@ fn test_create_payment_persists_escrow_with_gross_locked_amount() {
         let escrow = env
             .storage()
             .persistent()
-            .get::<crate::DataKey, crate::payments::EscrowAccount>(
-                &crate::DataKey::EscrowAccount(payment_id),
-            )
+            .get::<crate::DataKey, crate::payments::EscrowAccount>(&crate::DataKey::EscrowAccount(
+                payment_id,
+            ))
             .expect("EscrowAccount must be stored by create_payment");
 
         assert_eq!(
@@ -1537,8 +1539,5 @@ fn fee_structure_validate_fee_cap_fails_on_zero_gross() {
         performance_bonus: 0,
         fixed_fee: 0,
     };
-    assert_eq!(
-        fee.validate_fee_cap(0),
-        Err(PaymentError::InvalidAmount)
-    );
+    assert_eq!(fee.validate_fee_cap(0), Err(PaymentError::InvalidAmount));
 }

@@ -10,10 +10,13 @@
 //! - [x] `update_status`          — writes DataKey::Unit(id), StatusUnits index
 //! - [x] `expire_unit`            — 1 read + 1 write of DataKey::Unit(id), StatusUnits index
 //! - [x] `check_and_expire_batch` — N individual reads + writes of DataKey::Unit(id)
+//!   (`expire_unit` / `check_and_expire_batch` also rewrite HospitalUnits when an
+//!   undelivered allocation is dropped)
 
 use soroban_sdk::{symbol_short, Address, Env, Symbol, Vec};
 
 use crate::{
+    clear_hospital_allocation,
     constants::{
         MAX_BATCH_EXPIRY_SIZE, MAX_QUANTITY_ML, MAX_SHELF_LIFE_DAYS, MIN_QUANTITY_ML,
         MIN_SHELF_LIFE_DAYS, SECONDS_PER_DAY,
@@ -162,6 +165,21 @@ pub fn update_status(
     Ok(())
 }
 
+/// Expired is terminal, so a unit that was allocated (Reserved / InTransit /
+/// Quarantined with an allocation) but never delivered must drop its hospital
+/// allocation, or it stays listed in `query_by_hospital` forever (#1436).
+/// A Delivered unit was actually received, so its allocation is kept.
+fn release_undelivered_allocation(
+    env: &Env,
+    unit: &mut BloodUnit,
+    unit_id: u64,
+    old_status: BloodStatus,
+) {
+    if old_status != BloodStatus::Delivered {
+        clear_hospital_allocation(env, unit, unit_id);
+    }
+}
+
 /// Force mark a blood unit as expired.
 ///
 /// Reads the individual unit record, checks expiry, and persists the change.
@@ -185,6 +203,7 @@ pub fn expire_unit(env: &Env, unit_id: u64) -> Result<(), Error> {
 
     let old_status = unit.status;
     unit.status = BloodStatus::Expired;
+    release_undelivered_allocation(env, &mut unit, unit_id, old_status);
     env.storage()
         .persistent()
         .set(&DataKey::Unit(unit_id), &unit);
@@ -232,6 +251,7 @@ pub fn check_and_expire_batch(env: &Env, unit_ids: Vec<u64>) -> Result<Vec<u64>,
 
         let old_status = unit.status;
         unit.status = BloodStatus::Expired;
+        release_undelivered_allocation(env, &mut unit, unit_id, old_status);
         env.storage()
             .persistent()
             .set(&DataKey::Unit(unit_id), &unit);

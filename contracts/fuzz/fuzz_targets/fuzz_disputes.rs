@@ -1,19 +1,17 @@
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
+use libfuzzer_sys::fuzz_target;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    vec, Address, Bytes, Env, String as SorobanString,
+    Address, Bytes, Env, String as SorobanString, Vec as SorobanVec,
 };
 
 use health_chain_contract::payments::{
-    DisputeStatus, FeeStructure, PaymentStats, PaymentStatus, DEFAULT_DISPUTE_TIMEOUT_SECS,
+    Dispute, DisputeMetadata, DisputeStatus, FeeStructure, Payment, PaymentStats, PaymentStatus,
     HIGH_VALUE_THRESHOLD,
 };
-use health_chain_contract::{
-    Error, HealthChainContract, HealthChainContractClient,
-};
+use health_chain_contract::{DataKey, Error, HealthChainContract, HealthChainContractClient};
 
 /// Actions exercised against the payment + dispute state machine.
 /// All actor/payment references are indices into pre-built pools rather than
@@ -55,11 +53,11 @@ enum DisputeOperation {
 /// since that's the one branch point the issue calls out explicitly.
 #[derive(Arbitrary, Debug, Clone, Copy)]
 enum AmountKind {
-    Tiny,            // 1
-    JustBelowHigh,   // HIGH_VALUE_THRESHOLD - 1
-    ExactlyHigh,     // HIGH_VALUE_THRESHOLD
-    JustAboveHigh,   // HIGH_VALUE_THRESHOLD + 1
-    Large,           // HIGH_VALUE_THRESHOLD * 100
+    Tiny,          // 1
+    JustBelowHigh, // HIGH_VALUE_THRESHOLD - 1
+    ExactlyHigh,   // HIGH_VALUE_THRESHOLD
+    JustAboveHigh, // HIGH_VALUE_THRESHOLD + 1
+    Large,         // HIGH_VALUE_THRESHOLD * 100
 }
 
 impl AmountKind {
@@ -98,6 +96,43 @@ fn dispute_status_from_u8(v: u8) -> DisputeStatus {
     }
 }
 
+// Storage access mirrors the contract's per-record layout (#1394): each
+// payment, dispute and dispute deadline lives under its own DataKey. The
+// legacy PAY_RECS / DISP_REC / DISP_META maps are only read by the one-off
+// migration and are never written by current code.
+
+fn load_payment(env: &Env, contract_id: &Address, id: u64) -> Option<Payment> {
+    env.as_contract(contract_id, || {
+        env.storage().persistent().get(&DataKey::Payment(id))
+    })
+}
+
+fn store_payment(env: &Env, contract_id: &Address, payment: &Payment) {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment.id), payment)
+    });
+}
+
+fn load_dispute(env: &Env, contract_id: &Address, id: u64) -> Option<Dispute> {
+    env.as_contract(contract_id, || {
+        env.storage().persistent().get(&DataKey::Dispute(id))
+    })
+}
+
+fn load_dispute_metadata(env: &Env, contract_id: &Address, id: u64) -> Option<DisputeMetadata> {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeMetadata(id))
+    })
+}
+
+fn pick<T: Clone>(pool: &[T], idx: u8) -> T {
+    pool[(idx as usize) % pool.len()].clone()
+}
+
 fuzz_target!(|input: FuzzInput| {
     // Cap to prevent fuzzer timeout.
     if input.operations.len() > 50 {
@@ -114,10 +149,7 @@ fuzz_target!(|input: FuzzInput| {
 
     // Fixed actor pool: indices fuzzed via u8 % pool.len() rather than deriving
     // Arbitrary on Address directly (Address has no such impl).
-    let mut actors: Vec<Address> = vec![&env];
-    for _ in 0..6 {
-        actors.push_back(Address::generate(&env));
-    }
+    let actors: Vec<Address> = (0..6).map(|_| Address::generate(&env)).collect();
     let asset = Address::generate(&env);
 
     // Track created payment ids and dispute ids for index-based reference by
@@ -137,8 +169,8 @@ fuzz_target!(|input: FuzzInput| {
                 amount_kind,
                 fee_kind,
             } => {
-                let payer = actors.get((*payer_idx as u32) % actors.len()).unwrap();
-                let payee = actors.get((*payee_idx as u32) % actors.len()).unwrap();
+                let payer = pick(&actors, *payer_idx);
+                let payee = pick(&actors, *payee_idx);
 
                 // Skip the trivially-rejected same-payer/payee case; that's
                 // Payment::validate() territory, already covered by unit tests.
@@ -178,7 +210,7 @@ fuzz_target!(|input: FuzzInput| {
                 let caller = if *admin_is_caller {
                     admin.clone()
                 } else {
-                    actors.get(0).unwrap()
+                    actors[0].clone()
                 };
 
                 let result = client.try_create_payment(
@@ -211,7 +243,7 @@ fuzz_target!(|input: FuzzInput| {
                                     "INVARIANT VIOLATION: wrong error for unauthorized create_payment"
                                 );
                             }
-                        } else if let Ok(payment_id) = result {
+                        } else if let Ok(Ok(payment_id)) = result {
                             payment_ids.push(payment_id);
                         }
                     }
@@ -219,32 +251,20 @@ fuzz_target!(|input: FuzzInput| {
             }
 
             DisputeOperation::ForceEscrow { payment_idx } => {
-                // Mirrors move_payment_to_disputed_ready_state from test_payments.rs:
-                // tests reach into storage directly because there's no separate
-                // "fund escrow" entry point — escrow is created at payment time
-                // with medical_records_verified = false by default.
+                // Mirrors move_payment_to_disputed_ready_state from test_payments.rs.
+                // create_payment already stores payments as Escrowed (#1324), so
+                // this only matters for any payment left in Pending.
                 if payment_ids.is_empty() {
                     continue;
                 }
-                let payment_id = payment_ids[(*payment_idx as usize) % payment_ids.len()];
+                let payment_id = pick(&payment_ids, *payment_idx);
 
-                env.as_contract(&contract_id, || {
-                    use soroban_sdk::Map;
-                    let key = soroban_sdk::symbol_short!("PAY_RECS");
-                    if let Some(mut payments): Option<Map<u64, health_chain_contract::payments::Payment>> =
-                        env.storage().persistent().get(&key)
-                    {
-                        if let Some(mut payment) = payments.get(payment_id) {
-                            if payment.can_transition_to(PaymentStatus::Escrowed)
-                                || payment.status == PaymentStatus::Pending
-                            {
-                                payment.status = PaymentStatus::Escrowed;
-                                payments.set(payment_id, payment);
-                                env.storage().persistent().set(&key, &payments);
-                            }
-                        }
+                if let Some(mut payment) = load_payment(&env, &contract_id, payment_id) {
+                    if payment.status == PaymentStatus::Pending {
+                        payment.status = PaymentStatus::Escrowed;
+                        store_payment(&env, &contract_id, &payment);
                     }
-                });
+                }
             }
 
             DisputeOperation::RaiseDispute {
@@ -257,10 +277,8 @@ fuzz_target!(|input: FuzzInput| {
                 if payment_ids.is_empty() {
                     continue;
                 }
-                let payment_id = payment_ids[(*payment_idx as usize) % payment_ids.len()];
-                let raiser = actors
-                    .get((*raiser_idx as u32) % actors.len())
-                    .unwrap();
+                let payment_id = pick(&payment_ids, *payment_idx);
+                let raiser = pick(&actors, *raiser_idx);
 
                 let reason_text = "x".repeat((*reason_len as usize) % 64);
                 let reason = SorobanString::from_str(&env, &reason_text);
@@ -268,7 +286,7 @@ fuzz_target!(|input: FuzzInput| {
                 let digest_bytes = [*evidence_byte; 32];
                 let evidence_digest = Bytes::from_slice(&env, &digest_bytes);
 
-                let mut chunks = vec![&env];
+                let mut chunks = SorobanVec::new(&env);
                 for i in 0..(*num_chunks % 5) {
                     chunks.push_back(SorobanString::from_str(&env, &format!("chunk{}", i)));
                 }
@@ -281,27 +299,27 @@ fuzz_target!(|input: FuzzInput| {
                     &chunks,
                 );
 
-                if let Ok(dispute_id) = result {
-                    // INVARIANT: a dispute must only be raisable on a payment
-                    // that exists and is in Escrowed status (can_transition_to
-                    // Disputed). If it succeeded, the payment must now be Disputed.
-                    env.as_contract(&contract_id, || {
-                        use soroban_sdk::Map;
-                        let key = soroban_sdk::symbol_short!("PAY_RECS");
-                        let payments: Map<u64, health_chain_contract::payments::Payment> =
-                            env.storage().persistent().get(&key).unwrap();
-                        let payment = payments.get(payment_id).unwrap();
-                        assert_eq!(
-                            payment.status,
-                            PaymentStatus::Disputed,
-                            "INVARIANT VIOLATION: raise_dispute succeeded but payment not Disputed"
-                        );
-                    });
+                if let Ok(Ok(dispute_id)) = result {
+                    // INVARIANT: a dispute must only be raisable by the
+                    // payment's payer or payee (#1391), on a payment that could
+                    // transition to Disputed. If it succeeded, the payment must
+                    // now be Disputed.
+                    let payment = load_payment(&env, &contract_id, payment_id)
+                        .expect("INVARIANT VIOLATION: disputed payment missing");
+                    assert!(
+                        raiser == payment.payer || raiser == payment.payee,
+                        "INVARIANT VIOLATION: third party raised a dispute"
+                    );
+                    assert_eq!(
+                        payment.status,
+                        PaymentStatus::Disputed,
+                        "INVARIANT VIOLATION: raise_dispute succeeded but payment not Disputed"
+                    );
                     dispute_ids.push(dispute_id);
                     dispute_to_payment.push((dispute_id, payment_id));
                 }
-                // If it errored, fine -- e.g. PaymentNotFound or InvalidTransition
-                // (payment not yet Escrowed, or already Disputed/terminal).
+                // If it errored, fine -- e.g. Unauthorized, PaymentNotFound or
+                // InvalidTransition (payment already Disputed/terminal).
             }
 
             DisputeOperation::ResolveDispute {
@@ -311,7 +329,7 @@ fuzz_target!(|input: FuzzInput| {
                 if dispute_ids.is_empty() {
                     continue;
                 }
-                let dispute_id = dispute_ids[(*dispute_idx as usize) % dispute_ids.len()];
+                let dispute_id = pick(&dispute_ids, *dispute_idx);
                 let resolution = dispute_status_from_u8(*resolution_kind);
 
                 let result = client.try_resolve_dispute(&dispute_id, &resolution);
@@ -322,23 +340,18 @@ fuzz_target!(|input: FuzzInput| {
                     if let Some((_, payment_id)) =
                         dispute_to_payment.iter().find(|(d, _)| *d == dispute_id)
                     {
-                        env.as_contract(&contract_id, || {
-                            use soroban_sdk::Map;
-                            let pkey = soroban_sdk::symbol_short!("PAY_RECS");
-                            let payments: Map<u64, health_chain_contract::payments::Payment> =
-                                env.storage().persistent().get(&pkey).unwrap();
-                            let payment = payments.get(*payment_id).unwrap();
+                        let payment = load_payment(&env, &contract_id, *payment_id)
+                            .expect("INVARIANT VIOLATION: resolved dispute lost its payment");
 
-                            let expected = match resolution {
-                                DisputeStatus::ResolvedInFavorOfPayer => PaymentStatus::Refunded,
-                                DisputeStatus::ResolvedInFavorOfPayee => PaymentStatus::Completed,
-                                _ => PaymentStatus::Resolved,
-                            };
-                            assert_eq!(
-                                payment.status, expected,
-                                "INVARIANT VIOLATION: resolve_dispute set wrong payment status"
-                            );
-                        });
+                        let expected = match resolution {
+                            DisputeStatus::ResolvedInFavorOfPayer => PaymentStatus::Refunded,
+                            DisputeStatus::ResolvedInFavorOfPayee => PaymentStatus::Completed,
+                            _ => PaymentStatus::Resolved,
+                        };
+                        assert_eq!(
+                            payment.status, expected,
+                            "INVARIANT VIOLATION: resolve_dispute set wrong payment status"
+                        );
                     }
                 }
                 // Errors expected when: dispute not Open already, or dispute
@@ -347,11 +360,11 @@ fuzz_target!(|input: FuzzInput| {
 
             DisputeOperation::ProcessExpiredDisputes => {
                 let stats_before: PaymentStats = client.get_payment_stats();
-                let mut dispute_ids = soroban_sdk::Vec::new(&env);
+                let mut ids = SorobanVec::new(&env);
                 for (dispute_id, _) in dispute_to_payment.iter() {
-                    dispute_ids.push_back(*dispute_id);
+                    ids.push_back(*dispute_id);
                 }
-                let result = client.process_expired_disputes(&dispute_ids);
+                let result = client.process_expired_disputes(&ids);
 
                 if result > 0 {
                     let stats_after: PaymentStats = client.get_payment_stats();
@@ -367,6 +380,30 @@ fuzz_target!(|input: FuzzInput| {
                         "INVARIANT VIOLATION: total_auto_refunded decreased"
                     );
                 }
+
+                // INVARIANT: every auto-refunded dispute is persisted as
+                // resolved for the payer, with its payment Refunded.
+                let mut refunded_now = 0u32;
+                for (dispute_id, payment_id) in dispute_to_payment.iter() {
+                    let dispute = load_dispute(&env, &contract_id, *dispute_id).unwrap();
+                    if dispute.status == DisputeStatus::ResolvedInFavorOfPayer
+                        && dispute.resolved_at == Some(env.ledger().timestamp())
+                    {
+                        let payment = load_payment(&env, &contract_id, *payment_id).unwrap();
+                        assert_eq!(
+                            payment.status,
+                            PaymentStatus::Refunded,
+                            "INVARIANT VIOLATION: auto-refunded dispute left payment unrefunded"
+                        );
+                        refunded_now += 1;
+                    }
+                }
+                assert!(
+                    refunded_now >= result,
+                    "INVARIANT VIOLATION: process_expired_disputes reported {} refunds but persisted {}",
+                    result,
+                    refunded_now
+                );
             }
 
             DisputeOperation::AdvanceTime { seconds } => {
@@ -385,51 +422,37 @@ fuzz_target!(|input: FuzzInput| {
         }
 
         // ----- Global invariants, checked after every operation -----
-
-        // 1. No dispute should ever reference a payment_id that doesn't exist.
+        // Per-record storage has no enumeration, so walk the ids we created.
         for (dispute_id, payment_id) in &dispute_to_payment {
-            let _ = dispute_id;
-            env.as_contract(&contract_id, || {
-                use soroban_sdk::Map;
-                let pkey = soroban_sdk::symbol_short!("PAY_RECS");
-                if let Some(payments) =
-                    env.storage().persistent().get::<_, Map<u64, health_chain_contract::payments::Payment>>(&pkey)
-                {
-                    assert!(
-                        payments.get(*payment_id).is_some(),
-                        "GLOBAL INVARIANT VIOLATION: dispute references missing payment {}",
-                        payment_id
-                    );
-                }
-            });
-        }
+            // 1. No dispute should ever reference a payment_id that doesn't exist.
+            assert!(
+                load_payment(&env, &contract_id, *payment_id).is_some(),
+                "GLOBAL INVARIANT VIOLATION: dispute references missing payment {}",
+                payment_id
+            );
 
-        // 2. Every dispute should have matching DisputeMetadata with a
-        // deadline strictly after raised_at (per auto_refund_after_timeout test).
-        env.as_contract(&contract_id, || {
-            use soroban_sdk::Map;
-            let dkey = soroban_sdk::symbol_short!("DISP_REC");
-            let mkey = soroban_sdk::symbol_short!("DISP_META");
-            if let (Some(disputes), Some(metadata)) = (
-                env.storage()
-                    .persistent()
-                    .get::<_, Map<u64, health_chain_contract::payments::Dispute>>(&dkey),
-                env.storage()
-                    .persistent()
-                    .get::<_, Map<u64, health_chain_contract::payments::DisputeMetadata>>(&mkey),
-            ) {
-                for dispute_id in disputes.keys() {
-                    let dispute = disputes.get(dispute_id).unwrap();
-                    if let Some(meta) = metadata.get(dispute_id) {
-                        assert!(
-                            meta.dispute_deadline > dispute.raised_at,
-                            "GLOBAL INVARIANT VIOLATION: dispute_deadline <= raised_at for dispute {}",
-                            dispute_id
-                        );
-                    }
-                }
-            }
-        });
+            // 2. Every dispute must have DisputeMetadata with a deadline
+            // strictly after raised_at (per auto_refund_after_timeout test);
+            // without it the dispute can never be auto-refunded.
+            let dispute = load_dispute(&env, &contract_id, *dispute_id).unwrap_or_else(|| {
+                panic!(
+                    "GLOBAL INVARIANT VIOLATION: dispute {} missing from storage",
+                    dispute_id
+                )
+            });
+            let meta =
+                load_dispute_metadata(&env, &contract_id, *dispute_id).unwrap_or_else(|| {
+                    panic!(
+                        "GLOBAL INVARIANT VIOLATION: dispute {} has no deadline metadata",
+                        dispute_id
+                    )
+                });
+            assert!(
+                meta.dispute_deadline > dispute.raised_at,
+                "GLOBAL INVARIANT VIOLATION: dispute_deadline <= raised_at for dispute {}",
+                dispute_id
+            );
+        }
 
         // 3. process_expired_disputes is idempotent on disputes already resolved:
         // running it twice in a row with no time advance must not double-refund.

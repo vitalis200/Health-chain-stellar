@@ -242,10 +242,9 @@ pub fn bump_all_registries(env: &Env) {
         BloodStatus::Expired,
         BloodStatus::Discarded,
     ] {
-        let key = DataKey::StatusUnits(*status);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
+        // Index entries only exist once a unit has held that status;
+        // extending a missing key would trap.
+        bump_persistent(env, &DataKey::StatusUnits(*status));
     }
 }
 
