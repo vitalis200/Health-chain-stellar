@@ -4,14 +4,14 @@ use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    vec, Address, Env, Map, Symbol,
+    vec, Address, Env, Symbol, Vec as SorobanVec,
 };
 
 use health_chain_contract::payments::{
-    EscrowAccount, FeeStructure, MultiSigConfig, Payment, PaymentStatus, ReleaseConditions,
-    HIGH_VALUE_THRESHOLD,
+    EscrowAccount, FeeStructure, MultiSigConfig, Payment, PaymentStatus, PendingApproval,
+    ReleaseConditions, HIGH_VALUE_THRESHOLD,
 };
-use health_chain_contract::{Error, HealthChainContract, HealthChainContractClient};
+use health_chain_contract::{DataKey, Error, HealthChainContract, HealthChainContractClient};
 
 #[derive(Arbitrary, Debug, Clone)]
 enum PaymentOperation {
@@ -72,21 +72,26 @@ struct FuzzInput {
     operations: Vec<PaymentOperation>,
 }
 
-fn payments_key() -> Symbol {
-    soroban_sdk::symbol_short!("PAY_RECS")
+// Storage is per-record since the #1394 migration: payments, escrows and
+// pending approvals live under DataKey::Payment(id), DataKey::EscrowAccount(id)
+// and DataKey::PendingApprovalRecord(id). The legacy PAY_RECS / ESC_ACCS /
+// PEND_APR maps are never written by the contract any more.
+fn load_payment(env: &Env, payment_id: u64) -> Option<Payment> {
+    env.storage().persistent().get(&DataKey::Payment(payment_id))
 }
-fn escrow_key() -> Symbol {
-    soroban_sdk::symbol_short!("ESC_ACCS")
+fn load_escrow(env: &Env, payment_id: u64) -> Option<EscrowAccount> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::EscrowAccount(payment_id))
 }
-fn multisig_key() -> Symbol {
-    soroban_sdk::symbol_short!("MSIG_CFG")
-}
-fn approvals_key() -> Symbol {
-    soroban_sdk::symbol_short!("PEND_APR")
+fn load_approval(env: &Env, payment_id: u64) -> Option<PendingApproval> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PendingApprovalRecord(payment_id))
 }
 
 fuzz_target!(|input: FuzzInput| {
-  if input.operations.len() > 50 {
+    if input.operations.len() > 50 {
         return;
     }
 
@@ -99,7 +104,7 @@ fuzz_target!(|input: FuzzInput| {
     client.initialize(&admin);
 
     // Fixed actor pool (payers/payees/approvers/signers all draw from this).
-    let mut actors: Vec<Address> = vec![&env];
+    let mut actors: SorobanVec<Address> = vec![&env];
     for _ in 0..8 {
         actors.push_back(Address::generate(&env));
     }
@@ -181,7 +186,7 @@ fuzz_target!(|input: FuzzInput| {
                     continue;
                 }
 
-                if let Ok(payment_id) = result {
+                if let Ok(Ok(payment_id)) = result {
                     payment_ids.push(payment_id);
                     payment_amounts.push((payment_id, amount));
 
@@ -190,9 +195,8 @@ fuzz_target!(|input: FuzzInput| {
                     // medical_records_verified == false (per
                     // escrow_conditions_stored_at_payment_creation test).
                     env.as_contract(&contract_id, || {
-                        let escrows: Map<u64, EscrowAccount> =
-                            env.storage().persistent().get(&escrow_key()).unwrap();
-                        let escrow = escrows.get(payment_id).unwrap();
+                        let escrow = load_escrow(&env, payment_id)
+                            .expect("INVARIANT VIOLATION: no escrow account after create_payment");
                         assert_eq!(
                             escrow.locked_amount, amount,
                             "INVARIANT VIOLATION: escrow locked_amount != payment amount"
@@ -211,13 +215,13 @@ fuzz_target!(|input: FuzzInput| {
                 }
                 let payment_id = payment_ids[(*payment_idx as usize) % payment_ids.len()];
                 env.as_contract(&contract_id, || {
-                    let mut payments: Map<u64, Payment> =
-                        env.storage().persistent().get(&payments_key()).unwrap();
-                    let mut payment = payments.get(payment_id).unwrap();
-                    if payment.status == PaymentStatus::Pending {
-                        payment.status = PaymentStatus::Escrowed;
-                        payments.set(payment_id, payment);
-                        env.storage().persistent().set(&payments_key(), &payments);
+                    if let Some(mut payment) = load_payment(&env, payment_id) {
+                        if payment.status == PaymentStatus::Pending {
+                            payment.status = PaymentStatus::Escrowed;
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::Payment(payment_id), &payment);
+                        }
                     }
                 });
             }
@@ -237,9 +241,7 @@ fuzz_target!(|input: FuzzInput| {
                     .unwrap();
 
                 env.as_contract(&contract_id, || {
-                    let mut escrows: Map<u64, EscrowAccount> =
-                        env.storage().persistent().get(&escrow_key()).unwrap();
-                    if let Some(mut escrow) = escrows.get(payment_id) {
+                    if let Some(mut escrow) = load_escrow(&env, payment_id) {
                         let current = env.ledger().timestamp();
                         let min_ts = if *min_timestamp_offset >= 0 {
                             current.saturating_add(*min_timestamp_offset as u64)
@@ -251,8 +253,9 @@ fuzz_target!(|input: FuzzInput| {
                             min_timestamp: min_ts,
                             authorized_approver: Some(approver.clone()),
                         };
-                        escrows.set(payment_id, escrow);
-                        env.storage().persistent().set(&escrow_key(), &escrows);
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::EscrowAccount(payment_id), &escrow);
                     }
                 });
             }
@@ -263,7 +266,7 @@ fuzz_target!(|input: FuzzInput| {
                 caller_is_admin,
             } => {
                 let n = ((*num_signers % 5) + 1) as usize; // 1..=5 signers
-                let mut signers: Vec<Address> = vec![&env];
+                let mut signers: SorobanVec<Address> = vec![&env];
                 for i in 0..n {
                     signers.push_back(actors.get((i as u32) % actors.len()).unwrap());
                 }
@@ -318,15 +321,13 @@ fuzz_target!(|input: FuzzInput| {
 
                 let result = client.try_propose_release(&payment_id, &approver);
 
-                if let Ok(executed) = result {
+                if let Ok(Ok(executed)) = result {
                     if executed {
                         // INVARIANT: if propose_release reports executed,
                         // the payment must actually be Completed with
                         // escrow_released_at set.
                         env.as_contract(&contract_id, || {
-                            let payments: Map<u64, Payment> =
-                                env.storage().persistent().get(&payments_key()).unwrap();
-                            let payment = payments.get(payment_id).unwrap();
+                            let payment = load_payment(&env, payment_id).unwrap();
                             assert_eq!(
                                 payment.status,
                                 PaymentStatus::Completed,
@@ -342,13 +343,9 @@ fuzz_target!(|input: FuzzInput| {
                         if let Some(amt) = amount {
                             if amt >= HIGH_VALUE_THRESHOLD && multisig_configured {
                                 env.as_contract(&contract_id, || {
-                                    use health_chain_contract::payments::PendingApproval;
-                                    let approvals: Map<u64, PendingApproval> = env
-                                        .storage()
-                                        .persistent()
-                                        .get(&approvals_key())
-                                        .unwrap();
-                                    let approval = approvals.get(payment_id).unwrap();
+                                    let approval = load_approval(&env, payment_id).expect(
+                                        "INVARIANT VIOLATION: multisig release executed without a PendingApproval record",
+                                    );
                                     assert!(
                                         approval.approvals.len() >= configured_threshold,
                                         "INVARIANT VIOLATION: high-value release executed before reaching threshold ({} votes, threshold {})",
@@ -377,35 +374,25 @@ fuzz_target!(|input: FuzzInput| {
         // that doesn't match its own Payment.amount (would indicate desync
         // between the two storage maps).
         env.as_contract(&contract_id, || {
-            if let (Some(payments), Some(escrows)) = (
-                env.storage()
-                    .persistent()
-                    .get::<_, Map<u64, Payment>>(&payments_key()),
-                env.storage()
-                    .persistent()
-                    .get::<_, Map<u64, EscrowAccount>>(&escrow_key()),
-            ) {
-                for payment_id in payments.keys() {
-                    let payment = payments.get(payment_id).unwrap();
-                    if let Some(escrow) = escrows.get(payment_id) {
-                        assert_eq!(
-                            escrow.locked_amount, payment.amount,
-                            "GLOBAL INVARIANT VIOLATION: escrow/payment amount desync for {}",
-                            payment_id
-                        );
-                    }
+            for &payment_id in payment_ids.iter() {
+                let payment = load_payment(&env, payment_id).unwrap_or_else(|| {
+                    panic!(
+                        "GLOBAL INVARIANT VIOLATION: tracked payment {} missing from storage",
+                        payment_id
+                    )
+                });
+                if let Some(escrow) = load_escrow(&env, payment_id) {
+                    assert_eq!(
+                        escrow.locked_amount, payment.amount,
+                        "GLOBAL INVARIANT VIOLATION: escrow/payment amount desync for {}",
+                        payment_id
+                    );
                 }
             }
         });
         env.as_contract(&contract_id, || {
-            use health_chain_contract::payments::PendingApproval;
-            if let Some(approvals) = env
-                .storage()
-                .persistent()
-                .get::<_, Map<u64, PendingApproval>>(&approvals_key())
-            {
-                for payment_id in approvals.keys() {
-                    let approval = approvals.get(payment_id).unwrap();
+            for &payment_id in payment_ids.iter() {
+                if let Some(approval) = load_approval(&env, payment_id) {
                     if multisig_configured {
                         assert!(
                             approval.approvals.len() as usize <= configured_signer_count,
