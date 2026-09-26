@@ -28,7 +28,7 @@ enum DisputeOperation {
         amount_kind: AmountKind,
         fee_kind: FeeKind,
     },
-    ForceEscrow {
+    FundEscrow {
         payment_idx: u8,
     },
     RaiseDispute {
@@ -132,6 +132,7 @@ fuzz_target!(|input: FuzzInput| {
     // later operations, same bookkeeping pattern as pending_event_ids in the
     // custody harness.
     let mut payment_ids: Vec<u64> = Vec::new();
+    let mut payment_payers: Vec<(u64, Address)> = Vec::new();
     let mut dispute_ids: Vec<u64> = Vec::new();
     // Parallel map: dispute_id -> payment_id, so we can check cross-invariants.
     let mut dispute_to_payment: Vec<(u64, u64)> = Vec::new();
@@ -145,8 +146,8 @@ fuzz_target!(|input: FuzzInput| {
                 amount_kind,
                 fee_kind,
             } => {
-                let payer = actors.get((*payer_idx as u32) % actors.len()).unwrap();
-                let payee = actors.get((*payee_idx as u32) % actors.len()).unwrap();
+                let payer = actors[*payer_idx as usize % actors.len()].clone();
+                let payee = actors[*payee_idx as usize % actors.len()].clone();
 
                 // Skip the trivially-rejected same-payer/payee case; that's
                 // Payment::validate() territory, already covered by unit tests.
@@ -186,7 +187,7 @@ fuzz_target!(|input: FuzzInput| {
                 let caller = if *admin_is_caller {
                     admin.clone()
                 } else {
-                    actors.get(0).unwrap()
+                    actors[0].clone()
                 };
 
                 let result = client.try_create_payment(
@@ -221,16 +222,15 @@ fuzz_target!(|input: FuzzInput| {
                             }
                         } else if let Ok(Ok(payment_id)) = result {
                             payment_ids.push(payment_id);
+                            payment_payers.push((payment_id, payer.clone()));
                         }
                     }
                 }
             }
 
-            DisputeOperation::ForceEscrow { payment_idx } => {
-                // Mirrors move_payment_to_disputed_ready_state from test_payments.rs:
-                // tests reach into storage directly because there's no separate
-                // "fund escrow" entry point — escrow is created at payment time
-                // with medical_records_verified = false by default.
+            DisputeOperation::FundEscrow { payment_idx } => {
+                // Payments start Pending; the payer funds them through the
+                // real fund_escrow entrypoint before they can be disputed (#1431).
                 if payment_ids.is_empty() {
                     continue;
                 }
@@ -261,9 +261,7 @@ fuzz_target!(|input: FuzzInput| {
                     continue;
                 }
                 let payment_id = payment_ids[(*payment_idx as usize) % payment_ids.len()];
-                let raiser = actors
-                    .get((*raiser_idx as u32) % actors.len())
-                    .unwrap();
+                let raiser = actors[*raiser_idx as usize % actors.len()].clone();
 
                 let reason_text = "x".repeat((*reason_len as usize) % 64);
                 let reason = SorobanString::from_str(&env, &reason_text);
@@ -333,7 +331,7 @@ fuzz_target!(|input: FuzzInput| {
                                 payment.status, expected,
                                 "INVARIANT VIOLATION: resolve_dispute set wrong payment status"
                             );
-                        });
+                        }
                     }
                 }
                 // Errors expected when: dispute not Open already, or dispute
@@ -362,6 +360,20 @@ fuzz_target!(|input: FuzzInput| {
                         "INVARIANT VIOLATION: total_auto_refunded decreased"
                     );
                 }
+
+                // INVARIANT: an immediate second sweep must not refund or
+                // count any dispute again.
+                let stats_mid: PaymentStats = client.get_payment_stats();
+                assert_eq!(
+                    client.process_expired_disputes(&dispute_ids),
+                    0,
+                    "INVARIANT VIOLATION: dispute auto-refunded twice"
+                );
+                assert_eq!(
+                    client.get_payment_stats(),
+                    stats_mid,
+                    "INVARIANT VIOLATION: repeat sweep changed stats"
+                );
             }
 
             DisputeOperation::AdvanceTime { seconds } => {

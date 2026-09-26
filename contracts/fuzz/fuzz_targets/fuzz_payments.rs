@@ -22,8 +22,9 @@ enum PaymentOperation {
         amount_kind: AmountKind,
         negative_fee: bool,
     },
-    ForceEscrow {
+    FundEscrow {
         payment_idx: u8,
+        caller_idx: u8,
     },
     SatisfyEscrowConditions {
         payment_idx: u8,
@@ -111,12 +112,15 @@ fuzz_target!(|input: FuzzInput| {
     let asset = Address::generate(&env);
 
     let mut payment_ids: Vec<u64> = Vec::new();
+    let mut payment_payers: Vec<(u64, Address)> = Vec::new();
     // Track expected amount per payment_id so we can check the multisig vs
     // single-admin branch was taken correctly.
     let mut payment_amounts: Vec<(u64, i128)> = Vec::new();
     let mut multisig_configured = false;
     let mut configured_threshold: u32 = 0;
-    let mut configured_signer_count: usize = 0;
+    // Largest signer set ever configured: configure_multisig keeps in-flight
+    // votes, so a vote count is bounded by every signer ever allowed to vote.
+    let mut max_signer_count: usize = 0;
 
     for op in input.operations.iter() {
         match op {
@@ -127,8 +131,8 @@ fuzz_target!(|input: FuzzInput| {
                 amount_kind,
                 negative_fee,
             } => {
-                let payer = actors.get((*payer_idx as u32) % actors.len()).unwrap();
-                let payee = actors.get((*payee_idx as u32) % actors.len()).unwrap();
+                let payer = actors[*payer_idx as usize % actors.len()].clone();
+                let payee = actors[*payee_idx as usize % actors.len()].clone();
                 if payer == payee {
                     continue;
                 }
@@ -156,7 +160,7 @@ fuzz_target!(|input: FuzzInput| {
                 let caller = if *caller_is_admin {
                     admin.clone()
                 } else {
-                    actors.get(1).unwrap()
+                    actors[1].clone()
                 };
 
                 let result = client.try_create_payment(
@@ -188,7 +192,17 @@ fuzz_target!(|input: FuzzInput| {
 
                 if let Ok(Ok(payment_id)) = result {
                     payment_ids.push(payment_id);
+                    payment_payers.push((payment_id, payer.clone()));
                     payment_amounts.push((payment_id, amount));
+
+                    // INVARIANT: a new payment starts Pending — it must be
+                    // funded via fund_escrow before it can be released (#1431).
+                    let payment = read_payment(&env, &contract_id, payment_id).unwrap();
+                    assert_eq!(
+                        payment.status,
+                        PaymentStatus::Pending,
+                        "INVARIANT VIOLATION: new payment not Pending"
+                    );
 
                     // INVARIANT: escrow account must exist immediately after
                     // creation, pre-populated with locked_amount == amount and
@@ -205,11 +219,14 @@ fuzz_target!(|input: FuzzInput| {
                             !escrow.release_conditions.medical_records_verified,
                             "INVARIANT VIOLATION: medical_records_verified true by default"
                         );
-                    });
+                    }
                 }
             }
 
-            PaymentOperation::ForceEscrow { payment_idx } => {
+            PaymentOperation::FundEscrow {
+                payment_idx,
+                caller_idx,
+            } => {
                 if payment_ids.is_empty() {
                     continue;
                 }
@@ -236,9 +253,7 @@ fuzz_target!(|input: FuzzInput| {
                     continue;
                 }
                 let payment_id = payment_ids[(*payment_idx as usize) % payment_ids.len()];
-                let approver = actors
-                    .get((*approver_idx as u32) % actors.len())
-                    .unwrap();
+                let approver = actors[*approver_idx as usize % actors.len()].clone();
 
                 env.as_contract(&contract_id, || {
                     if let Some(mut escrow) = load_escrow(&env, payment_id) {
@@ -268,7 +283,7 @@ fuzz_target!(|input: FuzzInput| {
                 let n = ((*num_signers % 5) + 1) as usize; // 1..=5 signers
                 let mut signers: SorobanVec<Address> = vec![&env];
                 for i in 0..n {
-                    signers.push_back(actors.get((i as u32) % actors.len()).unwrap());
+                    signers.push_back(actors[i % actors.len()].clone());
                 }
                 let threshold_val = (*threshold % 6) as u32; // 0..=5, includes invalid 0
 
@@ -289,7 +304,7 @@ fuzz_target!(|input: FuzzInput| {
                     if config.validate().is_ok() {
                         multisig_configured = true;
                         configured_threshold = threshold_val;
-                        configured_signer_count = n;
+                        max_signer_count = max_signer_count.max(n);
                     } else {
                         // INVARIANT: an invalid config (zero threshold,
                         // threshold > len, or duplicates) must never be
@@ -310,9 +325,7 @@ fuzz_target!(|input: FuzzInput| {
                     continue;
                 }
                 let payment_id = payment_ids[(*payment_idx as usize) % payment_ids.len()];
-                let approver = actors
-                    .get((*approver_idx as u32) % actors.len())
-                    .unwrap();
+                let approver = actors[*approver_idx as usize % actors.len()].clone();
 
                 let amount = payment_amounts
                     .iter()
@@ -337,8 +350,7 @@ fuzz_target!(|input: FuzzInput| {
                                 payment.escrow_released_at.is_some(),
                                 "INVARIANT VIOLATION: executed release missing escrow_released_at"
                             );
-                        });
-
+                        }
 
                         if let Some(amt) = amount {
                             if amt >= HIGH_VALUE_THRESHOLD && multisig_configured {
@@ -352,8 +364,7 @@ fuzz_target!(|input: FuzzInput| {
                                         approval.approvals.len(),
                                         configured_threshold
                                     );
-                                    let _ = configured_signer_count;
-                                });
+                                }
                             }
                         }
                     }
@@ -404,6 +415,6 @@ fuzz_target!(|input: FuzzInput| {
                     }
                 }
             }
-        });
+        }
     }
 });
