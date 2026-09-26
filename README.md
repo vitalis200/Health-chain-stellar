@@ -101,3 +101,8 @@ For contract deployment, full environment variable reference, and contributor gu
 | `lifebank-soroban/` | [Lifebank Soroban README](./lifebank-soroban/README.md) |
 | `docs/contracts/` | [Contract Reference Docs](./docs/contracts/) |
 | `docs/architecture.md` | [Architecture Diagram](./docs/architecture.md) |
+
+## Handsoff notes
+
+<!-- handsoff-issue-1531 -->
+- #1531: [backend/route-deviation] RouteDeviationService injects three classes it never imports, breaking compilation and DI
